@@ -69,14 +69,24 @@ Remedy remedy_for(std::string_view op, std::string_view target) {
                                               : "Cap"};
     Remedy r;
     r.grant = cap_name + "(" + std::string{target} + ")";
-    r.cmd = "bastion grant " + std::string{op} + " " + std::string{target};
-    if (op == "fs.write") {
-        r.sanctioned_alternative = "write under $WORKSPACE or $TMPDIR";
-    } else if (op == "net.egress") {
+
+    // The remedy must be a command that ACTUALLY EXISTS. This previously
+    // emitted `bastion grant <op> <path>`, which was never implemented -- an
+    // agent following the instruction would just get "unknown subcommand", and
+    // the machine-readable denial (DESIGN.md §4.1) would be worse than silence
+    // because it sends the reader somewhere that cannot help.
+    if (op == "net.egress") {
+        r.cmd = "bastion run -t t3 --net " + std::string{target} + " -- <cmd>";
         r.sanctioned_alternative =
-            "use an allowlisted host, or request egress explicitly";
+            "use an allowlisted host, or re-run with --net for this one";
+    } else if (op == "fs.write") {
+        r.cmd = "bastion run -w " + std::string{target} + " -- <cmd>";
+        r.sanctioned_alternative = "write under $WORKSPACE or $TMPDIR";
     } else if (op == "fs.read") {
+        r.cmd = "bastion run -r " + std::string{target} + " -- <cmd>";
         r.sanctioned_alternative = "read under $WORKSPACE";
+    } else {
+        r.cmd = "bastion run -w " + std::string{target} + " -- <cmd>";
     }
     return r;
 }

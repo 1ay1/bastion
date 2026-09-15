@@ -200,7 +200,8 @@ void EgressProxy::Impl::serve_conn(int client) {
         const std::string body =
             "bastion: egress to " + host + ":" + std::to_string(port) +
             " is not allowlisted.\n"
-            "remedy: bastion run --net " + host + ":" + std::to_string(port) + "\n";
+            "remedy: bastion run -t t3 --net " + host + ":" +
+            std::to_string(port) + " -- <cmd>\n";
         const std::string resp =
             "HTTP/1.1 403 Forbidden\r\nContent-Length: " +
             std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;

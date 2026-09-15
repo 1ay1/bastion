@@ -42,9 +42,30 @@ int main() {
     const std::string j = denied.to_json();
     assert(has(j, "\"verdict\":\"deny\""));
     assert(has(j, "\"rule\":\"default-deny\""));
-    assert(has(j, "bastion grant fs.write /etc/hosts"));
     assert(has(j, "$WORKSPACE"));
+
+    // The remedy must name a command that EXISTS. This shipped as
+    // `bastion grant ...`, a subcommand that was never implemented -- an agent
+    // following it got "unknown subcommand", making the machine-readable
+    // denial worse than silence.
+    assert(has(j, "bastion run "));
+    assert(!has(j, "bastion grant"));
     std::printf("denial record:\n  %s\n\n", j.c_str());
+
+    // Every op's remedy must route to a real subcommand + flag.
+    for (auto* op : {"fs.read", "fs.write", "fs.exec", "net.egress"}) {
+        auto d = sealed.evaluate(op, "/nonexistent-target");
+        if (d.verdict != Verdict::Deny) continue;
+        assert(d.remedy.has_value());
+        assert(has(d.remedy->cmd, "bastion run "));
+        assert(!has(d.remedy->cmd, "bastion grant"));
+    }
+    // Egress remedies must include the tier, or the suggested command silently
+    // would NOT allowlist (per-host filtering only exists at T3).
+    auto net_denied = sealed.evaluate("net.egress", "evil.example.com:443");
+    assert(net_denied.verdict == Verdict::Deny);
+    assert(has(net_denied.remedy->cmd, "-t t3"));
+    assert(has(net_denied.remedy->cmd, "--net"));
 
     // ---- 3. T0 never claims a boundary it does not have --------------------
     auto observe = Policy{Tier::Observe}.seal();

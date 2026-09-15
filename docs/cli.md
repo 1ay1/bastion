@@ -14,6 +14,7 @@ bastion synthesize [--ledger PATH]            turn a session log into a policy
 
 | Option | Meaning |
 |---|---|
+| `-p, --policy FILE` | load a policy file (as written by `synthesize`). Combines with the flags below. |
 | `-w, --workspace PATH` | read+write grant. Repeatable. Default: current directory. |
 | `-r, --read PATH` | read-only grant. Repeatable. |
 | `--net HOST:PORT` | allow egress. Wildcards: `*.example.com`. Repeatable. |
@@ -92,6 +93,7 @@ Derives the minimal policy that would have allowed everything observed.
 ```sh
 bastion observe -- ./build.sh
 bastion synthesize > bastion.toml
+bastion run --policy bastion.toml -- ./build.sh    # the loop closes here
 ```
 
 ```toml
@@ -114,6 +116,36 @@ Guarantees worth knowing:
   rules instead and explains the refusal.
 - **With no evidence it refuses to emit a policy** rather than claiming "no
   grants needed".
+
+### Policy files
+
+`--policy FILE` reads the format back. It is a small TOML subset, parsed by
+hand rather than by a dependency — a security tool should not grow a
+third-party parser to read its own output.
+
+```toml
+tier = "T2"
+
+[[allow]]
+op    = "fs.write"       # fs.read | fs.write | fs.exec | net.egress | net.bind
+path  = "/srv/app"       # absolute path, or host:port for net.*
+why   = "build output"   # optional, carried into the audit log
+```
+
+Parsing **fails closed**: an unknown `op`, a missing `path`, an unquoted value
+or a bad tier stops the run with a line number rather than falling back to the
+permissive default.
+
+```
+$ bastion run --policy bad.toml -- ./build.sh
+error: bad.toml:1: unknown op 'fs.telepathy' (expected fs.read, fs.write,
+fs.exec, net.egress, net.bind)
+```
+
+A policy file **replaces** the default "grant the current directory" behaviour,
+so a file that deliberately omits the cwd does not get it back silently. Flags
+combine with the file (`--policy p.toml -r /extra`), and an explicit `--tier`
+overrides the file's, letting you tighten a committed policy without editing it.
 
 ---
 
@@ -251,7 +283,7 @@ boundary being narrated in prose:
 ```json
 {"verdict":"deny","op":"fs.write","target":"/etc/hosts","tier":"T2:kernel",
  "rule":"default-deny",
- "remedy":{"grant":"FsWrite(/etc/hosts)","cmd":"bastion grant fs.write /etc/hosts"},
+ "remedy":{"grant":"FsWrite(/etc/hosts)","cmd":"bastion run -w /etc/hosts -- <cmd>"},
  "sanctioned_alternative":"write under $WORKSPACE or $TMPDIR"}
 ```
 

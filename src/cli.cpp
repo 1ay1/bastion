@@ -6,6 +6,7 @@
 // Nobody is ever told "you're on your own".
 #include "bastion/ledger.hpp"
 #include "bastion/observe.hpp"
+#include "bastion/policy_file.hpp"
 #include "bastion/spawn.hpp"
 
 #include <cstdio>
@@ -58,6 +59,8 @@ USAGE
   bastion synthesize [--ledger PATH]       turn a session log into a policy
 
 POLICY OPTIONS
+  -p, --policy FILE      load a policy file (as written by `synthesize`).
+                         Combines with the flags below; both are applied.
   -w, --workspace PATH   read+write grant (default: current directory)
   -r, --read PATH        read-only grant
       --net HOST:PORT    allow egress to a host:port (wildcards: *.example.com)
@@ -86,6 +89,7 @@ EXAMPLES
   # Don't know what it needs? Watch it, then lock it down:
   bastion observe -- ./weird-legacy-build.sh
   bastion synthesize > bastion.toml
+  bastion run --policy bastion.toml -- ./weird-legacy-build.sh
 
   # Wide open because you're in a hurry — still recorded:
   bastion run --yolo -- ./weird-legacy-build.sh
@@ -110,7 +114,9 @@ struct Args {
     std::vector<std::string> workspace;
     std::vector<std::string> read;
     std::vector<std::string> net;
+    std::string policy_file;
     Tier tier = Tier::Kernel;
+    bool tier_explicit = false;
     bool yolo = false;
     bool json = false;
     bool no_ledger = false;
@@ -143,6 +149,7 @@ Args parse(int argc, char** argv) {
         };
         if (s == "-w" || s == "--workspace")   a.workspace.push_back(next("--workspace"));
         else if (s == "-r" || s == "--read")   a.read.push_back(next("--read"));
+        else if (s == "-p" || s == "--policy") a.policy_file = next("--policy");
         else if (s == "--net")                 a.net.push_back(next("--net"));
         else if (s == "--ledger")              a.ledger = next("--ledger");
         else if (s == "--no-ledger")           a.no_ledger = true;
@@ -151,6 +158,7 @@ Args parse(int argc, char** argv) {
         else if (s == "-t" || s == "--tier") {
             bool ok = false;
             a.tier = parse_tier(next("--tier"), ok);
+            a.tier_explicit = true;
             if (!ok) a.error = "unknown tier";
         } else if (s == "-h" || s == "--help") {
             a.cmd = "help";
@@ -167,7 +175,16 @@ Args parse(int argc, char** argv) {
     return a;
 }
 
-Sealed build_policy(const Args& a, Broker& broker) {
+// Returns nullopt (with `error` set) if a policy file was requested but is
+// unusable. A malformed policy must stop the run, never silently fall back to
+// the permissive default of "grant the current directory".
+//
+// Returns by optional rather than an out-param because `Sealed` is
+// deliberately NOT default-constructible -- the typestate says a sealed policy
+// can only come from Policy::seal(), and weakening that to make an out-param
+// compile would trade a compile-time guarantee for convenience.
+std::optional<Sealed> build_policy(const Args& a, Broker& broker,
+                                   std::string& error) {
     Policy p{a.tier};
 
     if (a.yolo) {
@@ -177,7 +194,35 @@ Sealed build_policy(const Args& a, Broker& broker) {
             .seal();
     }
 
-    if (a.workspace.empty() && a.read.empty()) {
+    bool from_file = false;
+    if (!a.policy_file.empty()) {
+        auto pf = load_policy(a.policy_file);
+        if (!pf.ok) {
+            error = a.policy_file;
+            if (pf.error_line > 0) error += ":" + std::to_string(pf.error_line);
+            error += ": " + pf.error;
+            return std::nullopt;
+        }
+        for (const auto& w : pf.warnings) {
+            std::fprintf(stderr, "bastion: [warning] %s\n", w.c_str());
+        }
+        // An explicit --tier on the command line overrides the file, so a user
+        // can tighten a committed policy without editing it.
+        p = Policy{a.tier_explicit ? a.tier : pf.tier};
+        for (const auto& r : pf.rules) {
+            if (any(r.right & (Right::NetEgress | Right::NetBind))) {
+                p = std::move(p).allow_egress(r.scope, r.provenance);
+            } else {
+                p = std::move(p).allow(r.right, r.scope, r.provenance);
+            }
+        }
+        from_file = true;
+    }
+
+    // Default the workspace to the CURRENT directory -- but only when the user
+    // gave no grants at all. A policy file that deliberately omits the cwd must
+    // not have it added back silently.
+    if (!from_file && a.workspace.empty() && a.read.empty()) {
         // Path-set authority means the CURRENT directory just works -- there is
         // no fixed sandbox root to symlink things into (DESIGN.md §3).
         std::error_code ec;
@@ -256,7 +301,13 @@ int cmd_doctor() {
 
 int cmd_explain(const Args& a) {
     Broker broker;
-    auto policy = build_policy(a, broker);
+    std::string perr;
+    auto built = build_policy(a, broker, perr);
+    if (!built) {
+        std::fprintf(stderr, "error: %s\n", perr.c_str());
+        return 2;
+    }
+    const Sealed& policy = *built;
     auto caps = active_backend();
 
     std::printf("%s", policy.explain().c_str());
@@ -291,7 +342,13 @@ int cmd_run(const Args& a) {
     }
 
     Broker broker;
-    auto policy = build_policy(a, broker);
+    std::string perr;
+    auto built = build_policy(a, broker, perr);
+    if (!built) {
+        std::fprintf(stderr, "error: %s\n", perr.c_str());
+        return 2;
+    }
+    const Sealed& policy = *built;
     auto caps = active_backend();
 
     // Never silently downgrade. A sandbox that quietly becomes weaker than
@@ -333,7 +390,7 @@ int cmd_run(const Args& a) {
         if (!allowed) {
             std::fprintf(stderr,
                          "bastion: egress REFUSED %s\n"
-                         "         remedy: bastion run --net %s\n",
+                         "         remedy: bastion run -t t3 --net %s -- <cmd>\n",
                          hostport.c_str(), hostport.c_str());
         }
     }

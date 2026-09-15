@@ -9,11 +9,12 @@ bastion run -- cargo test                     # tight, in whatever dir you're in
 bastion run -t t3 --net '*.pypi.org:443' -- pip install -r reqs.txt
 bastion observe -- ./legacy-build.sh          # don't know what it needs? watch it
 bastion synthesize > bastion.toml             # then lock it down, from evidence
+bastion run --policy bastion.toml -- ./legacy-build.sh
 ```
 
 | | |
 |---|---|
-| **macOS** | Working. T2 + T3, 12/12 tests, 29 adversarial escape attempts, 0 escapes. |
+| **macOS** | Working. T2 + T3, 13/13 tests, 29 adversarial escape attempts, 0 escapes. |
 | **Linux** | Landlock backend complete and wired; **never run on a real kernel**. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
 | **Windows** | Specified only (AppContainer + restricted token). |
 
@@ -79,9 +80,16 @@ $ bastion explain --yolo
 ```
 
 Because a wide-open run is still fully recorded, **the bypass is the on-ramp to
-a tight policy** — and CI proves the loop closes: observe a workload →
-synthesize → **re-run under the derived policy** → it must succeed, while paths
-it never touched stay denied.
+a tight policy** — and the loop closes for real, not just in a test:
+
+```sh
+bastion observe -- ./build.sh             # nothing enforced, everything recorded
+bastion synthesize > bastion.toml         # review it, commit it
+bastion run --policy bastion.toml -- ./build.sh
+```
+
+CI proves it end to end: observe → synthesize → **re-run under the derived
+policy** → it must succeed, while paths it never touched stay denied.
 
 ## Run in any directory
 
@@ -125,7 +133,7 @@ the sandbox is dead weight — the sandbox explains itself:
 
 ```json
 {"verdict":"deny","op":"fs.write","target":"/etc/hosts","tier":"T2:kernel",
- "remedy":{"cmd":"bastion grant fs.write /etc/hosts"},
+ "remedy":{"cmd":"bastion run -w /etc/hosts -- <cmd>"},
  "sanctioned_alternative":"write under $WORKSPACE or $TMPDIR"}
 ```
 
@@ -179,7 +187,7 @@ at T3.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
-(cd build && ctest --output-on-failure)     # 12/12
+(cd build && ctest --output-on-failure)     # 13/13
 
 ./build/bastion doctor
 ```
