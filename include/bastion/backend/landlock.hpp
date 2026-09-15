@@ -75,14 +75,22 @@ struct Ruleset {
 };
 
 // Translate a Sealed policy into a Landlock ruleset for THIS kernel.
-[[nodiscard]] Ruleset compile(const Sealed& policy, const AbiInfo& abi);
+//
+// `proxy_port`, when non-zero and the policy is T3+, pins egress to that
+// loopback port: it becomes the ONLY permitted TCP connect target, and
+// bastion's broker enforces the per-host allowlist there (see proxy.hpp).
+// Requires ABI v4+; on older kernels network rules cannot be mediated at all
+// and compile() says so in `warnings` rather than pretending.
+[[nodiscard]] Ruleset compile(const Sealed& policy, const AbiInfo& abi,
+                              std::uint16_t proxy_port = 0);
 
 // Apply to the current thread and its future children. Irreversible.
 // Must be called after fork() and before exec(); returns empty on success.
 //
 // Also sets PR_SET_NO_NEW_PRIVS, without which Landlock refuses to enforce for
 // an unprivileged process -- and which independently blocks setuid escalation.
-[[nodiscard]] std::string apply(const Sealed& policy);
+[[nodiscard]] std::string apply(const Sealed& policy,
+                                std::uint16_t proxy_port = 0);
 
 [[nodiscard]] BackendCaps probe();
 

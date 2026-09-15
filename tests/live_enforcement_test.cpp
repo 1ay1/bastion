@@ -11,6 +11,8 @@
 
 #if defined(__APPLE__)
 #  include "bastion/backend/seatbelt.hpp"
+#elif defined(__linux__)
+#  include "bastion/backend/landlock.hpp"
 #endif
 
 using namespace bastion;
@@ -31,7 +33,7 @@ static SpawnResult run(const Sealed& p, const std::string& sh) {
 }
 
 int main() {
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__linux__)
     std::puts("live enforcement tests: skipped (no backend on this platform)");
     return 0;
 #else
@@ -102,12 +104,18 @@ int main() {
                    .allow(Right::FsRead | Right::FsWrite, ws, "workspace")
                    .allow_egress("example.com:443", "test")
                    .seal();
+#if defined(__APPLE__)
     auto compiled_net = darwin::compile(net);
     bool warned = false;
     for (const auto& w : compiled_net.warnings) {
         if (w.find("cannot restrict by hostname") != std::string::npos) warned = true;
     }
     check(warned, "warns that Seatbelt cannot filter by hostname");
+#else
+    // Landlock filters by PORT (ABI v4+), so the T2 warning differs. What must
+    // hold on BOTH platforms is the next assertion: no grant => no egress.
+    (void)net;
+#endif
 
     auto nonet = run(tight, "curl -s -m 3 -o /dev/null https://example.com 2>/dev/null");
     check(nonet.launched() && nonet.exit_code != 0, "egress DENIED without grant");
@@ -127,6 +135,9 @@ int main() {
           "witness recorded in explain output");
 
     std::puts("\n== fail-closed behaviour ==");
+#if defined(__APPLE__)
+    // SBPL injection is specific to Seatbelt's textual profile language;
+    // Landlock takes structured syscall arguments and has no parser to fool.
     // A path with a control character must be rejected, not escaped-and-hoped.
     std::string bad = std::string{"/tmp/ba"} + '\n' + "d";
     auto badpol = Policy{Tier::Kernel}.allow(Right::FsRead, bad, "injection").seal();
@@ -146,6 +157,19 @@ int main() {
     } else {
         check(true, "SBPL injection payload rejected at compile time");
     }
+#else
+    // The portable equivalent: a policy naming a path that does not exist must
+    // never silently widen into something that does.
+    auto ghost = Policy{Tier::Kernel}
+                     .allow(Right::FsRead | Right::FsWrite, ws, "workspace")
+                     .allow(Right::FsRead, "/nonexistent-bastion-path", "ghost")
+                     .seal();
+    SpawnRequest greq;
+    greq.argv = {"/bin/sh", "-c", "cat /etc/passwd 2>/dev/null"};
+    auto gr = spawn(ghost, greq);
+    check(gr.launched() && gr.exit_code != 0,
+          "non-existent rule path does not widen the policy");
+#endif
 
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "all live enforcement tests passed" : "FAILURES",

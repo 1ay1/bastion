@@ -45,10 +45,14 @@ static void known_limit(const char* what, bool escaped, const char* why) {
 }
 
 int main() {
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__linux__)
     std::puts("adversarial suite: skipped (no kernel backend here)");
     return 0;
 #else
+    // Every attack below is platform-independent: they are things a
+    // prompt-injected agent would actually try, not API exercises. The Linux
+    // backend is expected to block all of them, but that is UNVERIFIED until
+    // someone runs this on a real kernel (docs/linux-bringup.md §6.2).
     const fs::path ws = "/tmp/bastion-adv";
     const fs::path secret_dir = "/tmp/bastion-adv-secret";
     fs::remove_all(ws);
@@ -169,9 +173,14 @@ int main() {
                run("touch /tmp/bastion-adv/x && mv /tmp/bastion-adv/x /tmp/bastion-adv/y"));
 
     std::puts("\n== 9. documented limits of T2, and how T3 closes them ==");
+#if defined(__APPLE__)
     // Seatbelt filters sockets, not hostnames, so at T2 any --net grant means
     // all outbound. Asserted as a LIMIT so the docs can never drift from the
     // enforced reality.
+    //
+    // Linux differs: Landlock filters by PORT (ABI v4+), so a --net grant with
+    // a port is genuinely narrower at T2 than it is on macOS. Left unasserted
+    // here until measured on a real kernel rather than guessed at.
     auto net = Policy{Tier::Kernel}
                    .allow(Right::FsRead | Right::FsWrite, ws, "workspace")
                    .allow_egress("example.com:443", "explicit grant")
@@ -184,6 +193,7 @@ int main() {
                 nres.launched() && nres.exit_code == 0,
                 "Seatbelt filters sockets, not hostnames. Use --tier t3, which "
                 "pins egress to a loopback broker that enforces the allowlist.");
+#endif
 
     // ...and T3 must actually close it. This is an ATTACK assertion, not a
     // limit: at T3 a non-allowlisted host must fail, and the child must not be

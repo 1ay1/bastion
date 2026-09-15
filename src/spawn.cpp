@@ -18,6 +18,11 @@
 #  include "bastion/proxy.hpp"
 // Declared at file scope: sandbox_init(3) has no public SDK header.
 extern "C" int sandbox_init(const char* profile, uint64_t flags, char** errorbuf);
+#elif defined(__linux__)
+#  include "bastion/backend/landlock.hpp"
+#  include "bastion/proxy.hpp"
+extern "C" char** environ;
+#  define BASTION_ENVIRON environ
 #else
 extern "C" char** environ;
 #  define BASTION_ENVIRON environ
@@ -159,12 +164,15 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         return out;
     }
 
-#if defined(__APPLE__)
-    // T3: stand up the egress broker BEFORE compiling, so the profile can pin
-    // outbound to its loopback port. Without the proxy running first there is
-    // no port to authorize, and the child would be left with no egress at all.
+    // ---- T3 egress broker (platform-independent) --------------------------
+    //
+    // The broker itself is portable C++; only the KERNEL PIN that makes it
+    // unbypassable is backend-specific (Seatbelt `remote ip localhost:PORT`,
+    // Landlock NET_CONNECT_TCP on that port). So it is started here, before
+    // either backend compiles its policy, and both pin to the same port.
     std::unique_ptr<EgressProxy> proxy;
     std::uint16_t proxy_port = 0;
+#if defined(__APPLE__) || defined(__linux__)
     if (policy.tier() >= Tier::Isolate && !policy.is_unconfined()) {
         std::vector<EgressRule> allow;
         for (const auto& r : policy.rules()) {
@@ -185,7 +193,9 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
             out.proxy_port = proxy_port;
         }
     }
+#endif
 
+#if defined(__APPLE__)
     auto compiled = darwin::compile(policy, proxy_port);
     if (!compiled.ok) {
         out.error = "policy compilation failed: " + compiled.error;
@@ -193,6 +203,32 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     }
     out.profile = compiled.profile;
     out.warnings = compiled.warnings;
+
+#elif defined(__linux__)
+    // Landlock has no text profile; the ruleset is applied directly in the
+    // child (see below). Compile here only to surface warnings and to FAIL
+    // BEFORE forking if the kernel cannot express what was asked for.
+    const auto abi = linux_ll::probe_abi();
+    if (abi.version < 0 && policy.tier() >= Tier::Kernel &&
+        !policy.is_unconfined()) {
+        out.error =
+            "policy requires T2 kernel enforcement but Landlock is "
+            "unavailable: " + abi.note +
+            " -- refusing to run unconfined";
+        return out;  // fail closed
+    }
+    {
+        auto rs = linux_ll::compile(policy, abi);
+        if (!rs.ok && policy.tier() >= Tier::Kernel && !policy.is_unconfined()) {
+            out.error = "ruleset compilation failed: " + rs.error;
+            return out;
+        }
+        out.warnings = rs.warnings;
+        out.profile = "landlock: " + abi.note + ", " +
+                      std::to_string(rs.paths.size()) + " path rule(s), " +
+                      std::to_string(rs.ports.size()) + " port rule(s)";
+    }
+
 #else
     out.warnings.emplace_back(
         "no kernel backend compiled for this platform; T2 unavailable");
@@ -215,7 +251,7 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     }
     for (const auto& kv : req.env) env_storage.push_back(kv);
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
     // Point the child at the broker. Every mainstream HTTP client honours
     // these, so tools work unmodified -- and it does not matter if one does
     // not: the kernel has already denied every other route out, so ignoring
@@ -281,6 +317,18 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         if (sandbox_init(compiled.profile.c_str(), 0, nullptr) != 0) {
             _exit(kExitSandboxFailed);
         }
+#elif defined(__linux__)
+        // Same ordering, same fail-closed contract. linux_ll::apply() also sets
+        // PR_SET_NO_NEW_PRIVS, which Landlock requires for an unprivileged
+        // process and which independently blocks setuid escalation.
+        //
+        // NOTE: this allocates (std::string), which is not async-signal-safe.
+        // It is acceptable only because bastion forks from a single-threaded
+        // context here; if the host ever spawns from a thread while another
+        // holds the malloc lock, this must be pre-compiled before fork().
+        if (!linux_ll::apply(policy, proxy_port).empty()) {
+            _exit(kExitSandboxFailed);
+        }
 #endif
         ::execve(cargv[0], cargv.data(), cenv.data());
         _exit(kExitExecFailed);
@@ -297,7 +345,7 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
 
     spawn_wait(out);
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
     // Harvest the broker's ledger before it is torn down. Every egress
     // decision the workload triggered is reported to the caller, so a T3 run
     // is as auditable as a filesystem one.

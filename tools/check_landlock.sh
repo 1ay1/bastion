@@ -148,4 +148,46 @@ echo "OK: UAPI struct layout, field names and syscall usage verified"
 c++ -std=c++23 -Wall -Wextra -I"$ROOT/include" \
     -fsyntax-only "$ROOT/src/backend/landlock.cpp"
 echo "OK: landlock.cpp parses clean on host"
+
+# ---------------------------------------------------------------------------
+# Cross-TU consistency. The checks above validate UAPI usage but NOT that the
+# Linux branch of spawn.cpp agrees with the Landlock backend's signatures --
+# and those live behind #if defined(__linux__), so a macOS build never sees
+# them. A mismatch there is invisible until someone builds on Linux, which is
+# exactly the failure this script exists to prevent.
+#
+# We cannot define __linux__ on macOS (libc++ takes its Linux paths and breaks),
+# so instead assert the call sites textually against the declarations.
+# ---------------------------------------------------------------------------
+fail=0
+check_decl() {
+  desc="$1"; file="$2"; pattern="$3"
+  if grep -qE "$pattern" "$file"; then
+    echo "OK: $desc"
+  else
+    echo "MISSING: $desc  (expected /$pattern/ in $file)"
+    fail=1
+  fi
+}
+
+check_decl "spawn.cpp includes the Landlock backend on Linux" \
+  "$ROOT/src/spawn.cpp" 'elif defined\(__linux__\)'
+check_decl "spawn.cpp applies Landlock in the child" \
+  "$ROOT/src/spawn.cpp" 'linux_ll::apply\(policy, proxy_port\)'
+check_decl "spawn.cpp fails closed when Landlock is unavailable" \
+  "$ROOT/src/spawn.cpp" 'refusing to run unconfined'
+check_decl "landlock.hpp declares apply(policy, proxy_port)" \
+  "$ROOT/include/bastion/backend/landlock.hpp" 'apply\(const Sealed& policy,'
+check_decl "landlock.hpp declares compile(policy, abi, proxy_port)" \
+  "$ROOT/include/bastion/backend/landlock.hpp" 'compile\(const Sealed& policy, const AbiInfo& abi,'
+check_decl "T3 pins egress to the broker port" \
+  "$ROOT/src/backend/landlock.cpp" 't3_broker'
+check_decl "T3 fails closed below ABI v4" \
+  "$ROOT/src/backend/landlock.cpp" 'needs Landlock ABI v4\+'
+
 rm -rf "$FAKE"
+if [ "$fail" -ne 0 ]; then
+  echo "FAILED: Linux spawn path is out of sync with the Landlock backend"
+  exit 1
+fi
+echo "OK: Linux spawn path is wired to the Landlock backend"

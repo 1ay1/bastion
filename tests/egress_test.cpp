@@ -62,7 +62,7 @@ int main() {
     check(proxy->port() != 0, "bound an ephemeral port");
     std::printf("      listening on 127.0.0.1:%u\n", proxy->port());
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
     std::puts("\n== T3 live enforcement ==");
     // NOTE: spawn() owns the broker. An earlier version of this test started
     // its own proxy and asserted against ITS counters, which stayed at 0/0

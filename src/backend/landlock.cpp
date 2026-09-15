@@ -121,7 +121,7 @@ AbiInfo probe_abi() {
     return info;
 }
 
-Ruleset compile(const Sealed& policy, const AbiInfo& abi) {
+Ruleset compile(const Sealed& policy, const AbiInfo& abi, std::uint16_t proxy_port) {
     Ruleset rs;
     if (abi.version < 0) {
         rs.error = abi.note;
@@ -177,9 +177,17 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi) {
     }
 
     bool net_requested = false;
+    const bool t3_broker = (proxy_port != 0 && policy.tier() >= Tier::Isolate);
+
     for (const auto& r : policy.rules()) {
         if (any(r.right & (Right::NetEgress | Right::NetBind))) {
             net_requested = true;
+            // At T3 the per-host allowlist is enforced by the broker, not by
+            // the kernel: the kernel's only job is to make the broker the sole
+            // reachable destination (see the proxy_port rule below), so
+            // individual host rules are deliberately NOT translated here.
+            if (t3_broker) continue;
+
             std::uint16_t port = parse_port(r.scope);
             if (port == 0) {
                 // Landlock filters by PORT, not hostname. Saying so is the
@@ -187,7 +195,7 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi) {
                 rs.warnings.emplace_back(
                     "net rule '" + r.scope +
                     "' has no usable port; Landlock cannot filter by hostname. "
-                    "Use T3 (proxy) for per-host allowlisting.");
+                    "Use --tier t3 for per-host allowlisting.");
                 continue;
             }
             Ruleset::PortRule pr;
@@ -220,6 +228,24 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi) {
         rs.paths.push_back({r.scope, allowed});
     }
 
+    // T3: the broker's loopback port is the ONLY permitted connect target.
+    // Everything else is denied by handled_access_net, so a compromised child
+    // cannot open its own socket and must go through the allowlist.
+    if (t3_broker) {
+        if (!abi.has_net_tcp) {
+            rs.error =
+                "T3 brokered egress needs Landlock ABI v4+ (kernel 6.7) to pin "
+                "outbound to the broker port; this kernel is " + abi.note +
+                ". Refusing to claim per-host filtering it cannot enforce.";
+            return rs;  // fail closed: T3 must not silently degrade to T2
+        }
+        Ruleset::PortRule pr;
+        pr.port = proxy_port;
+        pr.connect = true;
+        pr.bind = false;
+        rs.ports.push_back(pr);
+    }
+
     if (net_requested && !abi.has_net_tcp) {
         rs.warnings.emplace_back(
             "network rules requested but Landlock ABI <4 cannot mediate "
@@ -233,11 +259,11 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi) {
     return rs;
 }
 
-std::string apply(const Sealed& policy) {
+std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
     AbiInfo abi = probe_abi();
     if (abi.version < 0) return abi.note;
 
-    Ruleset rs = compile(policy, abi);
+    Ruleset rs = compile(policy, abi, proxy_port);
     if (!rs.ok) return "ruleset compilation failed: " + rs.error;
     if (policy.is_unconfined()) return {};  // nothing to enforce, by design
 
@@ -311,12 +337,23 @@ BackendCaps probe() {
     c.name = "landlock";
     AbiInfo abi = probe_abi();
     c.fs_path_authority = abi.version >= 1;
-    c.net_egress_filter = abi.has_net_tcp;  // by PORT only, not hostname
+    c.net_egress_filter = abi.has_net_tcp;  // by PORT; per-host needs the T3 broker
     c.device_control = abi.has_ioctl_dev;
-    c.namespace_isolation = false;  // that is T3's job
+    c.namespace_isolation = false;  // that is T3's other half, not implemented
     c.requires_setuid = false;      // unprivileged by design
-    c.max_tier = c.fs_path_authority ? Tier::Kernel : Tier::Advisory;
+    // T3 (brokered per-host egress) needs ABI v4+ to pin outbound to the
+    // broker port. Without it we can only promise T2, and say so.
+    if (!c.fs_path_authority) {
+        c.max_tier = Tier::Advisory;
+    } else if (abi.has_net_tcp) {
+        c.max_tier = Tier::Isolate;
+    } else {
+        c.max_tier = Tier::Kernel;
+    }
     c.version_note = abi.note;
+    if (c.fs_path_authority && !abi.has_net_tcp) {
+        c.version_note += " (no network mediation; T3 needs ABI v4+/kernel 6.7)";
+    }
     return c;
 }
 
@@ -331,13 +368,13 @@ AbiInfo probe_abi() {
 
 std::size_t AbiInfo::ruleset_attr_size() const noexcept { return 0; }
 
-Ruleset compile(const Sealed&, const AbiInfo& abi) {
+Ruleset compile(const Sealed&, const AbiInfo& abi, std::uint16_t) {
     Ruleset rs;
     rs.error = abi.note;
     return rs;
 }
 
-std::string apply(const Sealed&) {
+std::string apply(const Sealed&, std::uint16_t) {
     return "Landlock backend not compiled in";
 }
 
