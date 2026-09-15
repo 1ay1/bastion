@@ -30,7 +30,8 @@ set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp src/observe.cpp 
 if(APPLE)
     list(APPEND BASTION_SOURCES src/backend/seatbelt.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND BASTION_SOURCES src/backend/landlock.cpp)
+    list(APPEND BASTION_SOURCES src/backend/landlock.cpp src/backend/seccomp_notify.cpp
+                                src/backend/namespaces.cpp)
 endif()
 
 add_library(bastion STATIC ${BASTION_SOURCES})
@@ -88,6 +89,14 @@ if(BASTION_BUILD_TESTS)
     add_executable(adversarial_test tests/adversarial_test.cpp)
     target_link_libraries(adversarial_test PRIVATE bastion)
     add_test(NAME adversarial COMMAND adversarial_test)
+
+    # T0 observation: the mechanism `synthesize` depends on. Asserts that
+    # observing does not change the workload, that grandchildren are seen, and
+    # that paths/rights are recorded precisely enough to build a policy from.
+    add_executable(observe_test tests/observe_test.cpp)
+    target_link_libraries(observe_test PRIVATE bastion)
+    add_test(NAME observe COMMAND observe_test)
+    set_tests_properties(observe PROPERTIES TIMEOUT 120)
 
     # CLOSED LOOP: observe -> synthesize -> re-run under the derived policy.
     # Proves `bastion synthesize` emits a policy that actually WORKS, rather

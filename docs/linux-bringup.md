@@ -4,7 +4,7 @@ Everything you need to get bastion enforcing on Linux.
 
 **STATUS: the Landlock backend now runs, enforces, and passes its full suite on
 a real kernel.** First bring-up measured on **kernel 7.2.2-zen1 (Landlock ABI
-v10), GCC 16.2.1**: 13/13 tests green, adversarial suite 30 attempts / 0
+v10), GCC 16.2.1**: 14/14 tests green, adversarial suite 30 attempts / 0
 escapes, T3 per-host egress verified end to end against a live host.
 
 Five real bugs were found the moment it touched hardware; all are fixed, and
@@ -51,14 +51,69 @@ max tier:    T3:isolate
 path authority:   yes
 net filtering:    yes (by port)
 $ ctest
-100% tests passed out of 13
+100% tests passed out of 14
 ```
 
-Still open on Linux: `bastion observe` has no backend (needs Landlock audit,
-ABI v7+/kernel 6.15, or an eBPF collector), so `synthesize` has no evidence
-source here — it correctly refuses to emit a policy rather than guessing. T4
-(namespaces/microVM) is unimplemented, and `probe()` reports
-`namespace isolation: no` accordingly.
+Still open on Linux: T4 (microVM) is unimplemented, and the distro/ABI matrix
+in §6.3/§6.5 is unverified beyond this box — older ABI levels especially, which
+this kernel cannot exercise.
+
+### 0.1 Second pass: T0 observation and T3 namespaces
+
+The first pass made enforcement work. A second pass closed the two remaining
+gaps, both of which needed a mechanism rather than a bug fix:
+
+**T0 observation** (`src/backend/seccomp_notify.cpp`) — `bastion observe` had no
+Linux backend, so `synthesize` had no evidence and the "`--yolo` is an on-ramp"
+story (DESIGN.md §1) did not hold here at all. Now implemented with **seccomp
+user-notification**, chosen because it is the only option that is both
+unprivileged and complete:
+
+| mechanism | unprivileged | sees grandchildren | verdict |
+|---|---|---|---|
+| Landlock audit (ABI v7+) | yes | yes | only reports DENIALS — useless for an unconfined run |
+| eBPF | **no** (CAP_BPF/root) | yes | bastion refuses to ask for privilege |
+| ptrace | yes | awkward | conflicts with debuggers/sanitizers the workload may use |
+| **seccomp user-notify** | **yes** | **yes** | chosen |
+
+Measured via `tools/probe/seccomp_notify_probe.c` (uid 1000): the filter
+installs unprivileged, **survives `execve`**, paths are readable from the
+stopped process via `process_vm_readv`, and `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
+lets the syscall proceed — so observation does not alter the workload. Because
+the kernel reports the pid, grandchild attribution is **exact**, not inferred
+from a pid window the way the macOS log parser must.
+
+**T3 namespaces** (`src/backend/namespaces.cpp`) — `tier.hpp` defines T3 as
+"Kernel + user/net/pid/ipc namespaces". The broker delivered the network half;
+this delivers the process half, so `ps aux` inside the sandbox can no longer
+read other agents' command lines (which routinely carry tokens). Measured: 441
+host PIDs → **1**. The one non-obvious constraint is that a new user namespace
+cannot write its own `uid_map` — an unprivileged self-write is EPERM, since
+writing the map needs CAP_SETUID in the *parent* namespace. Hence the
+fork-then-map structure, which is also why `unshare --map-root-user` works
+where a naive in-process version does not.
+
+That removed the last entry from the adversarial suite's "documented limits":
+
+```
+== 9. documented limits of T2, and how T3 closes them ==
+  [BLOCKED] T3: egress to a non-allowlisted host
+  [BLOCKED] T3: raw socket bypassing the broker
+  [BLOCKED] T3: enumerate host processes
+
+NO ESCAPES: 0 escape(s), 0 documented limit(s)
+```
+
+Two further bugs surfaced in the process, both found by tests rather than by
+inspection:
+
+- `LANDLOCK_ACCESS_FS_REFER` is **directory-only**, like `READ_DIR`. A
+  synthesized policy grants write on an output *file*, and a write grant
+  carries REFER, so applying any synthesized policy failed with EINVAL. This is
+  why the closed-loop test matters: it exercises a policy shape that no
+  hand-written test had.
+- The observation backend ignored `req.cwd`, so relative paths resolved against
+  the wrong directory. Caught by `tests/observe_test.cpp` on its first run.
 
 ---
 
@@ -246,7 +301,7 @@ Work top to bottom. Each item is a claim that is currently **unverified**.
 ### 6.1 Basics
 
 - [x] `bastion doctor` reports `landlock` and the expected ABI version (v10)
-- [x] `ctest` passes — 13/13 on 7.2.2
+- [x] `ctest` passes — 14/14 on 7.2.2
 - [x] Write inside the workspace succeeds
 - [x] Read outside the workspace fails
 - [x] `/etc/shadow`, `~/.ssh`, `~/.aws` all denied

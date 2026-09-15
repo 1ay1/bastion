@@ -42,10 +42,10 @@ test suite, so the documented boundary cannot drift from the enforced one.
 
 | Tier | Real guarantee | Survives native code? |
 |---|---|---|
-| T0 observe | **None.** Records what *would* be denied. | — |
+| T0 observe | **None** (by design). Records what the workload actually did, without changing it. | — |
 | T1 advisory | Stops accidents. In-process, so bypassable. | No |
 | T2 kernel | Kernel-enforced path-set authority. | **Yes** |
-| T3 isolate | T2 + brokered per-host egress. | **Yes** |
+| T3 isolate | T2 + brokered per-host egress + PID/IPC isolation (Linux). | **Yes** |
 | T4 virtualize | Separate kernel. *Not implemented.* | — |
 
 T0 and T1 are **not boundaries** against a motivated adversary, and
@@ -161,12 +161,13 @@ flips and the docs get corrected.
 | Limit | Tier | Mitigation |
 |---|---|---|
 | Egress is all-or-nothing | T2 | Use `--tier t3` |
-| Host processes visible (`ps aux`) | T2, T3 | Needs T4; no unprivileged PID namespace on macOS |
+| Host processes visible (`ps aux`) | T2 | Use `--tier t3` on Linux (PID namespace). Still open on macOS, which has no unprivileged equivalent. |
 | No resource limits | all | Not implemented |
-| No IPC/mount namespaces | all | T3 currently means brokered egress only |
+| No mount namespace isolation of the filesystem | all | T3 gets a private mount ns for `/proc`, but does not pivot_root |
 | Kernel exploits | all | Out of scope; T4 |
 | Landlock ABI < v2 denies cross-dir rename | T2 Linux | Kernel 5.19+ |
 | Landlock ABI < v4 cannot mediate network | T3 Linux | T3 **refused**, not degraded |
+| Unprivileged user namespaces disabled | T3 Linux | Process isolation is dropped and **reported**; the file/network boundary is unaffected |
 
 ---
 

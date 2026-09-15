@@ -284,14 +284,41 @@ int cmd_doctor() {
     check("/dev/null present", fs::exists("/dev/null", ec), "check your system");
     check("/dev/urandom present", fs::exists("/dev/urandom", ec), "check your system");
 
-    bool any_cache = false;
-    for (const char* k : {"CARGO_HOME", "GOCACHE", "npm_config_cache",
-                          "PIP_CACHE_DIR", "CCACHE_DIR"}) {
-        if (const char* v = std::getenv(k); v && *v) any_cache = true;
+    // Toolchain caches. NOT a warning any more: an unset CARGO_HOME does not
+    // mean "no cache needed", it means the default (~/.cargo) is used, and the
+    // backend now grants those defaults when they exist. Report what will
+    // actually be granted, so the user can see it rather than be told off
+    // about an environment variable bastion does not need them to set.
+    std::vector<std::string> caches;
+    for (const char* k : {"CARGO_HOME", "GOCACHE", "GOMODCACHE",
+                          "npm_config_cache", "PIP_CACHE_DIR", "CCACHE_DIR",
+                          "ZIG_GLOBAL_CACHE_DIR"}) {
+        if (const char* v = std::getenv(k); v && *v) {
+            caches.push_back(std::string{k} + "=" + v);
+        }
     }
-    check("toolchain cache env present", any_cache,
-          "no CARGO_HOME/GOCACHE/npm_config_cache set; builds will re-download "
-          "dependencies on every run and the agent will look broken");
+    std::size_t defaults_found = 0;
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        for (const char* rel : {"/.cargo", "/.rustup", "/.cache/go-build",
+                                "/go/pkg/mod", "/.npm", "/.cache/pip",
+                                "/.ccache", "/.cache/zig"}) {
+            if (fs::exists(std::string{home} + rel, ec)) ++defaults_found;
+        }
+    }
+    check("toolchain caches granted", !caches.empty() || defaults_found > 0,
+          "no toolchain caches found; if you use cargo/go/npm, their default "
+          "cache dirs do not exist yet and the first build will populate them");
+    if (!caches.empty()) {
+        std::printf("         explicit: ");
+        for (std::size_t i = 0; i < caches.size(); ++i) {
+            std::printf("%s%s", i ? ", " : "", caches[i].c_str());
+        }
+        std::printf("\n");
+    }
+    if (defaults_found > 0) {
+        std::printf("         default:  %zu cache dir(s) under $HOME\n",
+                    defaults_found);
+    }
 
     std::printf("\n%s\n", problems == 0
                               ? "ready: the floor is satisfied."

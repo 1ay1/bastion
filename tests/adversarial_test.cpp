@@ -216,11 +216,33 @@ int main() {
                   return spawn(t3, r);
               }());
 
-    auto ps = run("ps aux 2>/dev/null | head -2");
-    known_limit("enumerate host processes",
-                ps.launched() && ps.exit_code == 0,
-                "T2/T3 have no PID namespace on macOS; process listing is "
-                "visible. Needs T4.");
+    // Process-table isolation. This was a DOCUMENTED LIMIT until T3 grew its
+    // namespace half: `ps aux` inside the sandbox listed every process on the
+    // box, leaking other agents' command lines (which carry tokens and repo
+    // paths). Neither Landlock nor Seatbelt can mediate it -- it is not a file
+    // or a socket -- so it needed unprivileged user+PID namespaces.
+    //
+    // Asserted at T3, because that is the tier that promises it (tier.hpp:
+    // "Kernel + user/net/pid/ipc namespaces"). At T2 it remains visible by
+    // design, and the tier guarantee says so.
+    {
+        SpawnRequest r;
+        // Count /proc entries rather than shelling to ps: ps needs a readable
+        // /proc, and this measures the kernel boundary rather than a tool.
+        r.argv = {"/bin/sh", "-c",
+                  "ls /proc 2>/dev/null | grep -c '^[0-9]' "
+                  "| awk '{exit ($1 > 20) ? 0 : 1}'"};
+        auto pids = spawn(t3, r);
+#if defined(__linux__)
+        // exit != 0 means FEWER than 20 pids were visible, i.e. isolated.
+        must_deny("T3: enumerate host processes", pids);
+#else
+        known_limit("enumerate host processes",
+                    pids.launched() && pids.exit_code == 0,
+                    "macOS has no PID namespace; Seatbelt cannot hide the "
+                    "process table. Needs T4.");
+#endif
+    }
 
     std::printf("\n%s: %d escape(s), %d documented limit(s)\n",
                 failures == 0 ? "NO ESCAPES" : "SANDBOX ESCAPED",

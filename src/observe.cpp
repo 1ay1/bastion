@@ -1,5 +1,9 @@
 #include "bastion/observe.hpp"
 
+#if defined(__linux__)
+#  include "bastion/backend/seccomp_notify.hpp"
+#endif
+
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -14,6 +18,8 @@
 #include <unordered_set>
 
 namespace bastion {
+
+#if defined(__APPLE__)
 
 namespace {
 
@@ -54,8 +60,11 @@ std::string_view map_op(std::string_view sb) {
 
 // Parse one unified-log line emitted by the Sandbox kernel extension:
 //
-//  2026-09-15 20:43:37.088 Df kernel[0:2306bd] (Sandbox) Sandbox: obs(94613) \
+//  2026-09-15 20:43:37.088 Df kernel[0:2306bd] (Sandbox) Sandbox: obs(94613)
 //      allow file-read-data /private/etc/hosts
+//
+// (that is one physical line; wrapped here for width -- NOT a continuation,
+// since a trailing backslash inside a // comment is a line splice and warns.)
 //
 // Returns false if the line is not an attributable access decision.
 bool parse_sandbox_line(std::string_view line, AuditRecord& out,
@@ -114,8 +123,6 @@ bool parse_sandbox_line(std::string_view line, AuditRecord& out,
 }
 
 }  // namespace
-
-#if defined(__APPLE__)
 
 ObserveCaps observe_probe() {
     ObserveCaps c;
@@ -310,13 +317,25 @@ ObserveResult observe(const SpawnRequest& req) {
 
 #else
 
+#  if defined(__linux__)
+
+// Linux T0 observation: seccomp user-notification. See
+// include/bastion/backend/seccomp_notify.hpp for why this mechanism and not
+// Landlock audit / eBPF / ptrace, and for the measured evidence that it works
+// unprivileged and survives execve.
+ObserveCaps observe_probe() { return linux_seccomp::probe(); }
+
+ObserveResult observe(const SpawnRequest& req) {
+    return linux_seccomp::observe(req);
+}
+
+#  else
+
 ObserveCaps observe_probe() {
     ObserveCaps c;
     c.available = false;
     c.mechanism = "none";
-    c.reason =
-        "no observation backend for this platform yet. On Linux this needs "
-        "Landlock audit (ABI v7+, kernel 6.15) or an eBPF/ptrace collector.";
+    c.reason = "no observation backend for this platform yet";
     return c;
 }
 
@@ -325,6 +344,8 @@ ObserveResult observe(const SpawnRequest&) {
     r.error = observe_probe().reason;
     return r;
 }
+
+#  endif
 
 #endif
 

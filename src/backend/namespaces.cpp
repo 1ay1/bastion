@@ -1,0 +1,225 @@
+#include "bastion/backend/namespaces.hpp"
+
+#if defined(__linux__)
+
+#  include <fcntl.h>
+#  include <sched.h>
+#  include <sys/mount.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+
+#  include <cerrno>
+#  include <cstdio>
+#  include <cstring>
+
+namespace bastion::linux_ns {
+
+namespace {
+
+// Write a whole buffer to a /proc file. These accept exactly one write(2), so a
+// partial write is a hard failure rather than something to retry.
+// `err` receives errno on failure, for an actionable message.
+bool write_file(const char* path, const char* data, int* err = nullptr) {
+    const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (err) *err = errno;
+        return false;
+    }
+    const ssize_t n = ::write(fd, data, std::strlen(data));
+    if (err && n != static_cast<ssize_t>(std::strlen(data))) *err = errno;
+    const bool ok = n == static_cast<ssize_t>(std::strlen(data));
+    ::close(fd);
+    return ok;
+}
+
+}  // namespace
+
+NsCaps probe() {
+    NsCaps c;
+
+    // Probing by ATTEMPT, not by reading sysctls: the sysctl names differ
+    // between distros (kernel.unprivileged_userns_clone is Debian/Arch-specific,
+    // user.max_user_namespaces is upstream) and neither accounts for a seccomp
+    // profile that blocks unshare(2) outright. Forking a throwaway child and
+    // asking the kernel is the only answer that cannot be wrong.
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        c.reason = std::string{"fork failed: "} + std::strerror(errno);
+        return c;
+    }
+    if (pid == 0) {
+        if (::unshare(CLONE_NEWUSER) != 0) _exit(1);
+        if (::unshare(CLONE_NEWPID) != 0) _exit(2);
+        if (::unshare(CLONE_NEWNS) != 0) _exit(3);
+        _exit(0);
+    }
+    int st = 0;
+    ::waitpid(pid, &st, 0);
+    const int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+
+    c.available = code == 0 || code >= 2;  // user ns worked if we got past it
+    c.pid = code == 0 || code == 3;
+    c.mount = code == 0;
+    if (code == 1) {
+        c.available = false;
+        c.reason =
+            "unprivileged user namespaces are disabled on this system "
+            "(sysctl user.max_user_namespaces or kernel.unprivileged_userns_clone); "
+            "process-table isolation is unavailable, the kernel file/network "
+            "boundary is unaffected";
+    } else if (code != 0) {
+        c.reason = "partial namespace support; some isolation is unavailable";
+    }
+    return c;
+}
+
+std::string enter_namespaces() {
+    // The uid/gid map of a new user namespace CANNOT be written by the process
+    // that created it: an unprivileged self-write returns EPERM, because
+    // writing a map requires CAP_SETUID in the PARENT namespace and the
+    // unshared process no longer has it there.
+    //
+    // MEASURED (kernel 7.2.2, uid 1000): unshare(CLONE_NEWUSER) succeeds, then
+    // write("/proc/self/uid_map") -> EPERM. Writing /proc/CHILD/uid_map from
+    // the parent succeeds. This is why `unshare --map-root-user` works while a
+    // naive in-process version does not, and it is the whole reason this
+    // function is structured as fork-then-map rather than a straight line.
+    //
+    // So: fork FIRST, let the child unshare, and have the parent write its map.
+    int ready[2];   // child -> parent: "I have unshared"
+    int mapped[2];  // parent -> child: "your map is written"
+    if (::pipe(ready) != 0) {
+        return std::string{"pipe failed: "} + std::strerror(errno);
+    }
+    if (::pipe(mapped) != 0) {
+        ::close(ready[0]);
+        ::close(ready[1]);
+        return std::string{"pipe failed: "} + std::strerror(errno);
+    }
+
+    const uid_t uid = ::getuid();
+    const gid_t gid = ::getgid();
+
+    const pid_t child = ::fork();
+    if (child < 0) {
+        return std::string{"fork failed: "} + std::strerror(errno);
+    }
+
+    if (child > 0) {
+        // ---- parent: write the child's maps, then mirror its exit ----------
+        ::close(ready[1]);
+        ::close(mapped[0]);
+
+        char c = 0;
+        const bool unshared = ::read(ready[0], &c, 1) == 1 && c == 'u';
+        ::close(ready[0]);
+
+        if (unshared) {
+            char path[64];
+            char buf[64];
+
+            // setgroups must be denied BEFORE gid_map, or the kernel refuses
+            // the gid_map write. That ordering is a documented security
+            // requirement: it stops a process dropping a supplementary group
+            // to gain access it would otherwise be denied.
+            std::snprintf(path, sizeof path, "/proc/%d/setgroups", child);
+            write_file(path, "deny");
+
+            std::snprintf(path, sizeof path, "/proc/%d/gid_map", child);
+            std::snprintf(buf, sizeof buf, "0 %u 1", static_cast<unsigned>(gid));
+            write_file(path, buf);
+
+            std::snprintf(path, sizeof path, "/proc/%d/uid_map", child);
+            std::snprintf(buf, sizeof buf, "0 %u 1", static_cast<unsigned>(uid));
+            write_file(path, buf);
+        }
+
+        c = 'm';
+        (void)::write(mapped[1], &c, 1);
+        ::close(mapped[1]);
+
+        // Mirror the workload's exit status so this extra process level is
+        // invisible to everything upstream.
+        int st = 0;
+        while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {
+        }
+        if (WIFSIGNALED(st)) {
+            ::signal(WTERMSIG(st), SIG_DFL);
+            ::raise(WTERMSIG(st));
+        }
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
+    }
+
+    // ---- child: unshare, wait to be mapped, then become pid 1 --------------
+    ::close(ready[0]);
+    ::close(mapped[1]);
+
+    if (::unshare(CLONE_NEWUSER) != 0) {
+        return std::string{"unshare(CLONE_NEWUSER) failed: "} + std::strerror(errno);
+    }
+
+    char c = 'u';
+    (void)::write(ready[1], &c, 1);
+    ::close(ready[1]);
+
+    // Block until the parent has written our uid/gid map. Acting before that
+    // would run as `nobody` (65534) and every subsequent step would fail in a
+    // way that looks like a permissions bug rather than a race.
+    (void)::read(mapped[0], &c, 1);
+    ::close(mapped[0]);
+
+    // PID + IPC. IPC keeps SysV queues and POSIX shared memory from being a
+    // side channel to processes outside the sandbox.
+    if (::unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC) != 0) {
+        return std::string{"unshare(CLONE_NEWPID|NEWNS|NEWIPC) failed: "} +
+               std::strerror(errno);
+    }
+
+    // unshare(CLONE_NEWPID) does NOT move the caller into the new namespace --
+    // it only takes effect for children. So we fork again: the grandchild
+    // becomes pid 1 and goes on to be the workload, while this level stays
+    // behind to reap it and mirror its exit status.
+    const pid_t inner = ::fork();
+    if (inner < 0) {
+        return std::string{"fork into PID namespace failed: "} + std::strerror(errno);
+    }
+    if (inner > 0) {
+        int st = 0;
+        while (::waitpid(inner, &st, 0) < 0 && errno == EINTR) {
+        }
+        if (WIFSIGNALED(st)) {
+            ::signal(WTERMSIG(st), SIG_DFL);
+            ::raise(WTERMSIG(st));
+        }
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
+    }
+
+    // ---- we are now pid 1 in a private PID namespace ------------------------
+
+    // Make mount propagation private, or mounting /proc would escape into the
+    // host mount namespace and affect the whole machine.
+    ::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
+
+    // A fresh /proc is what makes the PID namespace OBSERVABLE. Without it the
+    // inherited /proc still shows every host process -- the isolation would be
+    // real but invisible, and `ps aux` would keep leaking. Best-effort: if it
+    // fails the PID namespace still contains the workload.
+    ::mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr);
+
+    return {};
+}
+
+}  // namespace bastion::linux_ns
+
+#else
+
+namespace bastion::linux_ns {
+NsCaps probe() {
+    NsCaps c;
+    c.reason = "not Linux";
+    return c;
+}
+std::string enter_namespaces() { return "not Linux"; }
+}  // namespace bastion::linux_ns
+
+#endif

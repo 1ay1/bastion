@@ -21,6 +21,7 @@
 extern "C" int sandbox_init(const char* profile, uint64_t flags, char** errorbuf);
 #elif defined(__linux__)
 #  include "bastion/backend/landlock.hpp"
+#  include "bastion/backend/namespaces.hpp"
 #  include "bastion/proxy.hpp"
 extern "C" char** environ;
 #  define BASTION_ENVIRON environ
@@ -327,6 +328,19 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
                 : (policy.is_unconfined() ? std::string{} : choose_cwd(policy));
     const char* cwd = cwd_storage.empty() ? nullptr : cwd_storage.c_str();
 
+    // T3 process isolation: decided BEFORE fork, because probe() forks and
+    // allocates and neither is allowed in the child half of this function.
+    bool ns_isolate = false;
+#if defined(__linux__)
+    if (policy.tier() >= Tier::Isolate && !policy.is_unconfined()) {
+        const auto ns = linux_ns::probe();
+        ns_isolate = ns.available && ns.pid;
+        if (!ns_isolate && !ns.reason.empty()) {
+            out.warnings.push_back(ns.reason);
+        }
+    }
+#endif
+
     // Status pipe: the child writes one ChildStage byte if ITS OWN setup fails.
     // O_CLOEXEC means a successful execve closes it without a write, so the
     // parent reads EOF and knows the workload really started -- no inference
@@ -397,6 +411,23 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
             fail(ChildStage::Sandbox, kExitSandboxFailed);
         }
 #elif defined(__linux__)
+        // T3's process half (tier.hpp: "Kernel + user/net/pid/ipc namespaces").
+        // The broker covers the network; this hides the host process table, so
+        // `ps aux` inside the sandbox cannot read other agents' command lines.
+        //
+        // Ordering: BEFORE Landlock. A Landlock ruleset is immutable once
+        // enforced and unshare/mount would then be denied, so namespaces must
+        // come first. It is still after close_inherited_fds(), so nothing
+        // leaks in either direction.
+        //
+        // Degrades honestly: if unprivileged user namespaces are disabled, the
+        // workload keeps the full Landlock boundary and only loses process
+        // isolation, which compile() reports as a warning. Refusing to run
+        // would be worse -- it trades a real filesystem boundary for nothing.
+        if (ns_isolate) {
+            (void)linux_ns::enter_namespaces();
+        }
+
         // Same ordering, same fail-closed contract. linux_ll::apply() also sets
         // PR_SET_NO_NEW_PRIVS, which Landlock requires for an unprivileged
         // process and which independently blocks setuid escalation.

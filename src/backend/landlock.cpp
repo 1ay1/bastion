@@ -1,6 +1,8 @@
 #include "bastion/backend/landlock.hpp"
 
 #if defined(__linux__)
+#  include "bastion/backend/namespaces.hpp"
+
 #  include <fcntl.h>
 #  include <sys/prctl.h>
 #  include <sys/stat.h>
@@ -54,14 +56,23 @@ constexpr std::uint64_t kExecRights = LANDLOCK_ACCESS_FS_EXECUTE;
 
 // Rights that are only meaningful on a DIRECTORY. The kernel returns EINVAL if
 // a path_beneath rule carries one of these for a non-directory fd, so apply()
-// strips them per-inode. READ_DIR is the one that bites in practice: the
-// ergonomic floor grants read on regular files like /etc/ld.so.cache.
+// strips them per-inode.
+//
+// Two of these were found the hard way, each taking down every spawn that hit
+// it (a failed add_rule aborts apply(), and a failed apply() is fail-closed):
+//   - READ_DIR, via the ergonomic floor's read grant on the regular file
+//     /etc/ld.so.cache.
+//   - REFER, via a SYNTHESIZED policy: `observe` records a write to an output
+//     FILE (/tmp/ws/copy.txt), and a write grant carries REFER. The UAPI is
+//     explicit that REFER is granted "for a specific directory" -- it governs
+//     reparenting a hierarchy, which is meaningless for a regular file.
 constexpr std::uint64_t kDirOnlyRights =
     LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR |
     LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_CHAR |
     LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
     LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO |
-    LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SYM;
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SYM |
+    LANDLOCK_ACCESS_FS_REFER;
 
 // The per-run private temp dir, when the user has no $TMPDIR of their own.
 //
@@ -283,12 +294,33 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi, std::uint16_t proxy_po
         }
 
         // Toolchain caches, so dependencies are not re-downloaded every run
-        // (DESIGN.md §4). Only ever paths the user explicitly pointed at.
+        // (DESIGN.md §4).
         for (const char* var : {"CARGO_HOME", "GOCACHE", "GOMODCACHE",
                                 "npm_config_cache", "PIP_CACHE_DIR",
                                 "CCACHE_DIR", "ZIG_GLOBAL_CACHE_DIR"}) {
             if (const char* v = std::getenv(var); v && *v && v[0] == '/') {
                 tmp_dirs.emplace_back(v);
+            }
+        }
+
+        // DEFAULT cache locations, for the (normal) case where none of those
+        // are set. An unset CARGO_HOME does not mean "cargo needs no cache" --
+        // it means cargo uses ~/.cargo, which a policy that only grants the
+        // workspace does NOT cover. Every build then re-downloads the world,
+        // or fails outright, and the agent looks broken for reasons that have
+        // nothing to do with its task. `bastion doctor` used to just WARN
+        // about this; warning about a problem bastion can simply fix is worse
+        // than fixing it.
+        //
+        // Only paths that already EXIST are granted, so this never invents
+        // authority for a toolchain the user does not have installed.
+        if (const char* home = std::getenv("HOME"); home && *home == '/') {
+            const std::string h{home};
+            for (const char* rel : {"/.cargo", "/.rustup", "/.cache/go-build",
+                                    "/go/pkg/mod", "/.npm", "/.cache/pip",
+                                    "/.ccache", "/.cache/zig",
+                                    "/.cache/uv", "/.cache/yarn"}) {
+                tmp_dirs.push_back(h + rel);
             }
         }
 
@@ -517,7 +549,13 @@ BackendCaps probe() {
     c.fs_path_authority = abi.version >= 1;
     c.net_egress_filter = abi.has_net_tcp;  // by PORT; per-host needs the T3 broker
     c.device_control = abi.has_ioctl_dev;
-    c.namespace_isolation = false;  // that is T3's other half, not implemented
+    // T3's process half. Probed at runtime, never assumed: hardened distros
+    // disable unprivileged user namespaces, and bastion itself may be running
+    // inside a container that forbids nesting.
+    {
+        const auto ns = linux_ns::probe();
+        c.namespace_isolation = ns.available && ns.pid;
+    }
     c.requires_setuid = false;      // unprivileged by design
     // T3 (brokered per-host egress) needs ABI v4+ to pin outbound to the
     // broker port. Without it we can only promise T2, and say so.
