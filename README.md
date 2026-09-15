@@ -2,9 +2,12 @@
 
 Cross-platform sandboxing for AI agents, in modern type-theoretic C++23.
 
-**Status:** foundation layer. Capability algebra, tier model, and policy
-evaluation are implemented and tested (6/6). Platform backends are specified
-(`DESIGN.md`) and not yet wired.
+**Status:** working sandbox on macOS. Capability algebra, tier model, policy
+evaluation, Seatbelt (T2) enforcement, spawn, audit ledger, synthesizer and CLI
+are implemented and tested (10/10, incl. 27 adversarial escape attempts). The
+Landlock (T2/Linux) backend is written with ABI v1..v10 probing and its UAPI
+usage is typechecked in CI, but is **not yet run on a live kernel**. Windows
+AppContainer and T3/T4 are specified only (`DESIGN.md`).
 
 ## The problem this exists to fix
 
@@ -141,8 +144,42 @@ error*, so privilege cannot creep along a call chain. Lifecycle is
 simply does not exist on `Sealed`, mirroring the kernel's own semantics (a
 Landlock ruleset is immutable once enforced) instead of re-checking at runtime.
 
-These claims are **verified, not asserted** — four negative cases must fail to
-compile, enforced by `ctest`:
+These claims are **verified, not asserted** — see below.
+
+## Verified, not asserted
+
+Security claims are worth nothing unless CI checks them. `ctest` runs **10
+suites**, all green on macOS 26.6.2 / arm64 / Apple clang 21.
+
+**27 real escape attempts, 0 escapes** (`tests/adversarial_test.cpp`) — symlink
+farms pointed at `/etc` and `/`, `../` traversal, sibling-prefix confusion,
+copying `sh` into the workspace to shed policy, `~/.ssh` + `~/.aws` + keychain +
+shell history, `DYLD_INSERT_LIBRARIES` injection, LaunchAgent persistence.
+
+The three symlink cases are the field report's own workaround, run as an attack.
+Under `bwrap` a symlink farm over-grants; path-set authority denies all three.
+
+### The escape this found
+
+On **both** Seatbelt and Landlock, access rights attach to the **open file
+description**, not the path. So a descriptor opened *before* confinement keeps
+working *after* it and survives `exec`:
+
+```
+parent opened fd=4 on /tmp/bastion-fd-secret.txt BEFORE confinement
+confined.
+  CHILD: read(4) succeeded -> FLAG{fd-inherited}
+  ==> FD_LEAK: inherited descriptor bypasses path policy
+```
+
+The child was denied the path and still read the file in full. One leaked
+descriptor voids the whole filesystem policy — and agent hosts are exactly the
+programs that hold credentials and logs open while spawning tools. `spawn()` now
+closes every fd above stderr in the child before confining; `O_CLOEXEC`
+discipline in the caller is not an acceptable answer, because a sandbox that is
+only safe when every caller is careful is not a boundary.
+
+### Type-level claims: 4 negative cases must FAIL to compile
 
 ```
 negative_compile_1 ... Passed   # widening read -> read|write
@@ -151,12 +188,39 @@ negative_compile_3 ... Passed   # copying a capability
 negative_compile_4 ... Passed   # laundering Unconfined in with normal rights
 ```
 
+### Honest limits at T2 (asserted as limits, so docs can't drift)
+
+- **Egress is all-or-nothing.** Seatbelt filters sockets, not hostnames;
+  Landlock filters by port. Per-host allowlisting needs T3. `bastion explain`
+  says so.
+- **Host processes are visible.** No PID namespace at T2.
+- **T0/T1 are not boundaries** against a motivated adversary, and say so.
+
 ## Build
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-(cd build && ctest --output-on-failure)     # 6/6
+(cd build && ctest --output-on-failure)     # 10/10
+
+./tools/demo.sh                            # end-to-end CLI walkthrough
+```
+
+## Try it
+
+```sh
+# Tight, in whatever directory you're already in:
+bastion run -- cargo test
+
+# See the REAL boundary, including what the backend can't enforce:
+bastion explain -w . --net api.example.com:443
+
+# Check the ergonomic floor before an agent hits it the hard way:
+bastion doctor
+
+# Wide open because you're in a hurry -- still fully recorded:
+bastion run --yolo -- ./weird-legacy-build.sh
+bastion synthesize > bastion.toml    # now lock it down, from evidence
 ```
 
 ## Non-goals

@@ -1,6 +1,7 @@
 #include "bastion/spawn.hpp"
 
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -78,6 +79,33 @@ bool is_dangerous_env(std::string_view kv) {
         if (kv.find(s) != std::string_view::npos) return true;
     }
     return false;
+}
+
+// Close every descriptor above stderr before exec.
+//
+// SECURITY -- this closes a MEASURED sandbox escape, not a theoretical one.
+// Access rights attach to an OPEN FILE DESCRIPTION, not to the path, on both
+// Seatbelt and Landlock (the Landlock docs state this explicitly). So a
+// descriptor opened BEFORE confinement keeps working afterwards and survives
+// exec. Verified: a child denied the path could still read(2) an inherited fd
+// and recovered the secret in full -- the entire path policy bypassed by one
+// leaked descriptor.
+//
+// Agent hosts are exactly the programs that hold config, credential and log
+// files open while spawning tools, so this is a live exposure. bastion closes
+// the range rather than trusting every caller to set O_CLOEXEC everywhere.
+//
+// Async-signal-safe: only close(2) and getrlimit-derived arithmetic.
+void close_inherited_fds() {
+    int max_fd = -1;
+    struct rlimit rl {};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        max_fd = static_cast<int>(rl.rlim_cur);
+    }
+    if (max_fd < 0 || max_fd > 65536) max_fd = 65536;  // sane cap
+    for (int fd = STDERR_FILENO + 1; fd < max_fd; ++fd) {
+        ::close(fd);  // EBADF is fine and expected
+    }
 }
 
 }  // namespace
@@ -188,6 +216,12 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // Ordering is load-bearing (see spawn.hpp). Only async-signal-safe
         // calls past this point; no allocation, no iostreams.
         if (cwd && ::chdir(cwd) != 0) _exit(kExitChdirFailed);
+
+        // Drop inherited descriptors BEFORE confining. An fd opened by the
+        // parent carries its own access rights past the sandbox boundary
+        // (measured -- see close_inherited_fds), so leaving one open would
+        // hand the child a hole straight through the path policy.
+        close_inherited_fds();
 
 #if defined(__APPLE__)
         // Confinement lands here: after fork (so bastion stays unconfined),

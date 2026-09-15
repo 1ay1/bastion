@@ -80,6 +80,11 @@ if(BASTION_BUILD_TESTS)
     target_link_libraries(ledger_test PRIVATE bastion)
     add_test(NAME ledger COMMAND ledger_test)
 
+    # ADVERSARIAL: real escape attempts. A failure here is a sandbox escape.
+    add_executable(adversarial_test tests/adversarial_test.cpp)
+    target_link_libraries(adversarial_test PRIVATE bastion)
+    add_test(NAME adversarial COMMAND adversarial_test)
+
     # Verify the Landlock backend's UAPI usage even when not on Linux.
     add_test(NAME landlock_uapi
              COMMAND ${CMAKE_COMMAND} -E env sh

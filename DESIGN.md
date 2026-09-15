@@ -240,7 +240,70 @@ directly on `landlock_*`, `sandbox_init`, `CreateProcessAsUser`, and
 
 ---
 
-## 6. Non-goals
+## 6. Threat model, and what is actually verified
+
+### 6.1 Measured: inherited file descriptors bypass the path policy
+
+The most serious finding of the build so far, and the reason path-set authority
+needs a spawn discipline rather than just a good profile.
+
+On **both** Seatbelt and Landlock, access rights attach to the **open file
+description**, not to the path. The Landlock docs state this outright. So a
+descriptor opened *before* confinement keeps working *after* it, and survives
+`exec`. Measured (`/tmp/fdraw.cpp`, reproduced in `tests/adversarial_test.cpp`
+§5b):
+
+```
+parent opened fd=4 on /tmp/bastion-fd-secret.txt BEFORE confinement
+confined.
+  CHILD: read(4) succeeded -> FLAG{fd-inherited}
+  ==> FD_LEAK: inherited descriptor bypasses path policy
+```
+
+The child was denied the path and still recovered the full contents. One leaked
+descriptor voids the entire filesystem policy.
+
+This is a live exposure for agent hosts specifically: they are exactly the
+programs that hold config, credential, session and log files open while spawning
+tools. `O_CLOEXEC` discipline in the host is not a sufficient answer, because a
+sandbox that is only safe when every caller is careful is not a boundary.
+`spawn()` therefore closes every descriptor above stderr in the child, between
+`fork()` and confinement.
+
+### 6.2 Verified with adversarial tests, not assertions
+
+`tests/adversarial_test.cpp` runs 27 real escape attempts: **0 escapes**.
+
+| Class | Attempts | Notable |
+|---|---|---|
+| Symlink escapes | 3 | link workspace → secret dir, → `/etc`, → `/` |
+| Path traversal | 4 | `../`, `.././`, `//double//slash` |
+| Sibling-prefix confusion | 1 | `/x/ws` must not authorize `/x/ws-secret` |
+| Re-confinement / regain | 3 | copy `sh` into workspace and exec it; nested subshells |
+| Credential theft | 6 | `~/.ssh`, `~/.aws`, keychain, history, `.gitconfig`, `.npmrc` |
+| Inherited descriptors | 2 | raw `read(2)` and `/dev/fd/N` (§6.1) |
+| Environment hygiene | 1 | `DYLD_INSERT_LIBRARIES` + `*_TOKEN` stripped |
+| Persistence writes | 4 | `/etc`, `~/.zshrc`, `/usr/local/bin`, LaunchAgents |
+| Workspace still usable | 4 | write, read, mkdir, rename |
+
+The symlink cases are the field report's own workaround, run as an attack: under
+`bwrap` a symlink farm over-grants, whereas path-set authority denies all three.
+
+### 6.3 Honest limits at T2 (asserted as limits, not hidden)
+
+The suite asserts these as `LIMIT`, so the documented boundary can never drift
+from the enforced one:
+
+- **Egress is all-or-nothing.** Seatbelt filters sockets, not hostnames, so once
+  any `--net` grant exists, a connection to a non-allowlisted host succeeds.
+  Per-host allowlisting requires T3 (proxy interception). `bastion explain`
+  prints this warning; Landlock is the same, filtering by **port** only.
+- **Host processes are visible.** No PID namespace at T2; `ps aux` works. T3.
+- **T0/T1 are not boundaries** against a motivated adversary, and say so.
+
+---
+
+## 7. Non-goals
 
 - Not a container runtime; no image format, no registry, no OCI.
 - Not a replacement for SELinux/AppArmor — bastion composes with them (Landlock
