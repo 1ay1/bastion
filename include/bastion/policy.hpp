@@ -27,6 +27,16 @@ class Sealed;
 
 // ---------------------------------------------------------------------------
 // Policy — mutable builder stage.
+//
+// Builder methods consume `&&` and return a Policy BY VALUE. Returning
+// `Policy&&` instead would be a live footgun: the natural non-chained usage
+//
+//     p = std::move(p).allow(...);      // self-move-assignment!
+//
+// silently clears the rule vector, producing an EMPTY policy that still looks
+// valid. That defect shipped here once and the CLI demo caught it -- writes to
+// the workspace were denied and `explain` printed "rules (0)". Returning by
+// value makes the temporary a distinct object, so both styles are safe.
 // ---------------------------------------------------------------------------
 
 class Policy {
@@ -38,7 +48,8 @@ public:
     // metadata. Both are required for correctness — measured, see DESIGN.md
     // §2.1: an un-canonicalized rule silently UNDER-grants on macOS, while a
     // symlink farm silently OVER-grants under bwrap.
-    Policy&& allow(Right r, const std::filesystem::path& p, std::string why) && {
+    [[nodiscard]] Policy allow(Right r, const std::filesystem::path& p,
+                               std::string why) && {
         std::error_code ec;
         auto canon = std::filesystem::weakly_canonical(p, ec);
         rules_.push_back(Rule{r, (ec ? p : canon).string(), std::move(why)});
@@ -51,12 +62,15 @@ public:
         return std::move(*this);
     }
 
-    Policy&& allow_egress(std::string host_port, std::string why) && {
+    [[nodiscard]] Policy allow_egress(std::string host_port, std::string why) && {
         rules_.push_back(Rule{Right::NetEgress, std::move(host_port), std::move(why)});
         return std::move(*this);
     }
 
-    Policy&& at_tier(Tier t) && { tier_ = t; return std::move(*this); }
+    [[nodiscard]] Policy at_tier(Tier t) && {
+        tier_ = t;
+        return std::move(*this);
+    }
 
     // ---- The bypass, as a capability rather than a power switch -----------
     //
@@ -64,7 +78,7 @@ public:
     // what it does NOT do: it does not disable bastion, does not drop below T1,
     // and does not stop the audit log. The user gets their frictionless flow;
     // the system keeps the ledger (DESIGN.md §1).
-    Policy&& unconfined(UnconfinedCap&& cap) && {
+    [[nodiscard]] Policy unconfined(UnconfinedCap&& cap) && {
         rules_.push_back(Rule{Right::Unconfined, "*", std::string{cap.provenance()}});
         unconfined_ = true;
         if (tier_ < Tier::Advisory) tier_ = Tier::Advisory;

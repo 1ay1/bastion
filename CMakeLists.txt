@@ -26,7 +26,14 @@ else()
 endif()
 message(STATUS "bastion: platform backend = ${BASTION_PLATFORM}")
 
-add_library(bastion STATIC src/policy.cpp)
+set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp)
+if(APPLE)
+    list(APPEND BASTION_SOURCES src/backend/seatbelt.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND BASTION_SOURCES src/backend/landlock.cpp)
+endif()
+
+add_library(bastion STATIC ${BASTION_SOURCES})
 target_include_directories(bastion PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
@@ -36,6 +43,10 @@ target_compile_options(bastion PRIVATE
     -Wold-style-cast -Wcast-qual -Wformat=2
     $<$<CONFIG:Release>:-D_FORTIFY_SOURCE=2>
     -fstack-protector-strong)
+
+add_executable(bastion_cli src/cli.cpp)
+set_target_properties(bastion_cli PROPERTIES OUTPUT_NAME bastion)
+target_link_libraries(bastion_cli PRIVATE bastion)
 
 if(BASTION_HAVE_LANDLOCK_H)
     target_compile_definitions(bastion PUBLIC BASTION_HAVE_LANDLOCK=1)
@@ -57,6 +68,22 @@ if(BASTION_BUILD_TESTS)
     add_executable(policy_test tests/policy_test.cpp)
     target_link_libraries(policy_test PRIVATE bastion)
     add_test(NAME policy COMMAND policy_test)
+
+    # LIVE enforcement: spawns real processes and asserts the kernel actually
+    # blocked them. Without this we would only be testing that we generate
+    # plausible-looking policy text.
+    add_executable(live_enforcement_test tests/live_enforcement_test.cpp)
+    target_link_libraries(live_enforcement_test PRIVATE bastion)
+    add_test(NAME live_enforcement COMMAND live_enforcement_test)
+
+    add_executable(ledger_test tests/ledger_test.cpp)
+    target_link_libraries(ledger_test PRIVATE bastion)
+    add_test(NAME ledger COMMAND ledger_test)
+
+    # Verify the Landlock backend's UAPI usage even when not on Linux.
+    add_test(NAME landlock_uapi
+             COMMAND ${CMAKE_COMMAND} -E env sh
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_landlock.sh)
 
     # Negative compile tests: each case MUST be rejected by the type system.
     # A "compile error" security claim is worthless if it is never verified.

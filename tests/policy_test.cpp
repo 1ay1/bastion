@@ -78,6 +78,30 @@ int main() {
     assert(has(std::string{tier_guarantee(Tier::Advisory)}, "not a motivated"));
     assert(has(std::string{tier_guarantee(Tier::Isolate)}, "no setuid"));
 
+    // ---- 6. REGRESSION: non-chained builder usage must not self-destruct ---
+    // Builders that returned `Policy&&` made `p = std::move(p).allow(...)` a
+    // self-move-assignment, silently emptying the policy. The result looked
+    // valid but denied everything; only the live CLI demo exposed it.
+    {
+        Policy p{Tier::Kernel};
+        p = std::move(p).allow(Right::FsRead | Right::FsWrite, "/tmp", "one");
+        p = std::move(p).allow(Right::FsRead, "/usr", "two");
+        p = std::move(p).allow_egress("example.com:443", "three");
+        auto s = std::move(p).seal();
+        assert(s.rules().size() >= 3);
+        assert(s.evaluate("fs.write", "/tmp/x").verdict == Verdict::Allow);
+        assert(s.evaluate("fs.read", "/usr/include/x.h").verdict == Verdict::Allow);
+    }
+    // ...and the chained style stays equivalent.
+    {
+        auto s = Policy{Tier::Kernel}
+                     .allow(Right::FsRead | Right::FsWrite, "/tmp", "one")
+                     .allow(Right::FsRead, "/usr", "two")
+                     .seal();
+        assert(s.rules().size() >= 2);
+        assert(s.evaluate("fs.write", "/tmp/x").verdict == Verdict::Allow);
+    }
+
     std::puts("all policy tests passed");
     return 0;
 }

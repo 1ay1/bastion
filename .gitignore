@@ -3,3 +3,4 @@ build/
 *.a
 compile_commands.json
 .DS_Store
+.agentty/
