@@ -43,7 +43,7 @@ int main() {
         add(Verdict::Allow, "fs.read", "/proj/src/d.cpp");
         add(Verdict::Allow, "fs.write", "/proj/build/out.o");
         add(Verdict::Allow, "net.egress", "registry.npmjs.org:443");
-        add(Verdict::Deny,  "fs.read", "/Users/ayush/.ssh/id_ed25519");
+        add(Verdict::Deny,  "fs.read", "/home/user/.ssh/id_ed25519");
         check(led.flush().empty(), "ledger flushed to disk");
     }
     check(fs::exists(path), "ledger file created");
@@ -76,8 +76,8 @@ int main() {
     {
         Ledger led2{"/tmp/bastion-ledger-test/l2.jsonl"};
         // Many reads directly under $HOME must not coalesce into $HOME itself.
-        for (const char* p : {"/Users/ayush/a", "/Users/ayush/b",
-                              "/Users/ayush/c", "/Users/ayush/d"}) {
+        for (const char* p : {"/home/user/a", "/home/user/b",
+                              "/home/user/c", "/home/user/d"}) {
             AuditRecord r;
             r.verdict = Verdict::Allow;
             r.op = "fs.read";
@@ -85,13 +85,13 @@ int main() {
             led2.record(r);
         }
         SynthesisOptions opts;
-        opts.never_widen_to.push_back("/Users/ayush");
+        opts.never_widen_to.push_back("/home/user");
         auto s2 = synthesize(led2, opts);
         const std::string t2 = s2.to_toml();
-        check(!has(t2, "path  = \"/Users/ayush\"\n"),
+        check(!has(t2, "path  = \"/home/user\"\n"),
               "did NOT coalesce into the home directory");
         check(has(t2, "declined to coalesce"), "explained the refusal");
-        check(has(t2, "/Users/ayush/a"), "emitted individual paths instead");
+        check(has(t2, "/home/user/a"), "emitted individual paths instead");
     }
 
     std::puts("\n== cpp output ==");

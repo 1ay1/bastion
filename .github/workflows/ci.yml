@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS (Seatbelt, T2+T3)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build -j
+      - name: Doctor
+        run: ./build/bastion doctor
+      - name: Test
+        # The egress suite needs outbound network; GitHub runners have it.
+        run: ctest --test-dir build --output-on-failure
+
+  linux:
+    name: Linux (Landlock) — UNVERIFIED backend
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel + Landlock status
+        # Recorded even on failure: the ABI version explains most Linux results.
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || echo "securityfs not mounted"
+          dmesg 2>/dev/null | grep -i landlock || echo "(no landlock dmesg line)"
+      - name: Install headers
+        run: sudo apt-get update && sudo apt-get install -y linux-libc-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build -j
+      - name: Doctor
+        run: ./build/bastion doctor
+      - name: Test
+        # This backend has never run on real hardware. Failures here are
+        # EXPECTED until someone works through docs/linux-bringup.md §6 --
+        # they are the point of this job, not a regression.
+        continue-on-error: true
+        run: ctest --test-dir build --output-on-failure
+
+  portability:
+    name: Landlock UAPI + spawn wiring
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Typecheck the Linux path from macOS
+        # Catches Linux-only breakage without a Linux box: the #if __linux__
+        # branches are invisible to a macOS compile, so a signature mismatch
+        # would otherwise surface only when someone builds on Linux.
+        run: sh tools/check_landlock.sh

@@ -59,13 +59,13 @@ int main() {
 
     // 1. grants carry provenance
     auto rw = b.grant<Right::FsRead | Right::FsWrite>(
-        "/Users/ayush/projects/bastion", Witness{"workspace root"});
+        "/tmp/bastion-workspace", Witness{"workspace root"});
     assert(rw.provenance().find("workspace root") != std::string_view::npos);
     assert(rw.provenance().find("cap_test.cpp") != std::string_view::npos);
 
     // 2. narrowing is allowed, and preserves scope + provenance
     auto ro = std::move(rw).derive<Right::FsRead>();
-    assert(ro.scope() == "/Users/ayush/projects/bastion");
+    assert(ro.scope() == "/tmp/bastion-workspace");
     assert(Readable<decltype(ro)> && !Writable<decltype(ro)>);
 
     // 3. authority is usable where required

@@ -60,7 +60,7 @@ int main() {
                     .seal();
     assert(yolo.is_unconfined());
 
-    for (auto* t : {"/etc/hosts", "/Users/ayush/.ssh/id_ed25519", "evil.com:443"}) {
+    for (auto* t : {"/etc/hosts", "/home/user/.ssh/id_ed25519", "evil.com:443"}) {
         auto r = yolo.evaluate(t[0] == '/' ? "fs.write" : "net.egress", t);
         assert(r.verdict == Verdict::Allow);      // frictionless
         assert(r.rule == "unconfined");           // attributed
