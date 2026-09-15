@@ -26,7 +26,7 @@ else()
 endif()
 message(STATUS "bastion: platform backend = ${BASTION_PLATFORM}")
 
-set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp src/observe.cpp)
+set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp src/observe.cpp src/proxy.cpp)
 if(APPLE)
     list(APPEND BASTION_SOURCES src/backend/seatbelt.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -92,6 +92,13 @@ if(BASTION_BUILD_TESTS)
     target_link_libraries(closed_loop_test PRIVATE bastion)
     add_test(NAME closed_loop COMMAND closed_loop_test)
     set_tests_properties(closed_loop PROPERTIES TIMEOUT 120)
+
+    # T3 egress: per-host allowlisting the child cannot route around.
+    # Needs outbound network; skipped implicitly if the host is offline.
+    add_executable(egress_test tests/egress_test.cpp)
+    target_link_libraries(egress_test PRIVATE bastion)
+    add_test(NAME egress COMMAND egress_test)
+    set_tests_properties(egress PROPERTIES TIMEOUT 180)
 
     # Verify the Landlock backend's UAPI usage even when not on Linux.
     add_test(NAME landlock_uapi

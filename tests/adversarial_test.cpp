@@ -168,9 +168,10 @@ int main() {
     must_allow("rename within workspace",
                run("touch /tmp/bastion-adv/x && mv /tmp/bastion-adv/x /tmp/bastion-adv/y"));
 
-    std::puts("\n== 9. documented limits of T2 (not bugs) ==");
-    // Seatbelt filters sockets, not hostnames; and T2 has no PID/IPC
-    // namespace. We assert these are LIMITS so the boundary stays honest.
+    std::puts("\n== 9. documented limits of T2, and how T3 closes them ==");
+    // Seatbelt filters sockets, not hostnames, so at T2 any --net grant means
+    // all outbound. Asserted as a LIMIT so the docs can never drift from the
+    // enforced reality.
     auto net = Policy{Tier::Kernel}
                    .allow(Right::FsRead | Right::FsWrite, ws, "workspace")
                    .allow_egress("example.com:443", "explicit grant")
@@ -179,15 +180,37 @@ int main() {
     nreq.argv = {"/bin/sh", "-c",
                  "curl -s -m 5 -o /dev/null https://1.1.1.1 2>/dev/null"};
     auto nres = spawn(net, nreq);
-    known_limit("egress to a NON-allowlisted host after any --net grant",
+    known_limit("T2: egress to a NON-allowlisted host after any --net grant",
                 nres.launched() && nres.exit_code == 0,
-                "Seatbelt filters sockets, not hostnames. Per-host allowlisting "
-                "needs T3 (proxy). `bastion explain` warns about this.");
+                "Seatbelt filters sockets, not hostnames. Use --tier t3, which "
+                "pins egress to a loopback broker that enforces the allowlist.");
+
+    // ...and T3 must actually close it. This is an ATTACK assertion, not a
+    // limit: at T3 a non-allowlisted host must fail, and the child must not be
+    // able to skip the broker by opening its own socket.
+    auto t3 = Policy{Tier::Isolate}
+                  .allow(Right::FsRead | Right::FsWrite, ws, "workspace")
+                  .allow_egress("example.com:443", "explicit grant")
+                  .seal();
+    must_deny("T3: egress to a non-allowlisted host",
+              [&] {
+                  SpawnRequest r;
+                  r.argv = {"/bin/sh", "-c",
+                            "curl -s -m 8 -o /dev/null https://1.1.1.1 2>/dev/null"};
+                  return spawn(t3, r);
+              }());
+    must_deny("T3: raw socket bypassing the broker",
+              [&] {
+                  SpawnRequest r;
+                  r.argv = {"/bin/sh", "-c", "nc -w 3 -z 1.1.1.1 443 2>/dev/null"};
+                  return spawn(t3, r);
+              }());
 
     auto ps = run("ps aux 2>/dev/null | head -2");
     known_limit("enumerate host processes",
                 ps.launched() && ps.exit_code == 0,
-                "T2 has no PID namespace; process listing is visible. Use T3.");
+                "T2/T3 have no PID namespace on macOS; process listing is "
+                "visible. Needs T4.");
 
     std::printf("\n%s: %d escape(s), %d documented limit(s)\n",
                 failures == 0 ? "NO ESCAPES" : "SANDBOX ESCAPED",

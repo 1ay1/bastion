@@ -289,16 +289,53 @@ sandbox that is only safe when every caller is careful is not a boundary.
 The symlink cases are the field report's own workaround, run as an attack: under
 `bwrap` a symlink farm over-grants, whereas path-set authority denies all three.
 
-### 6.3 Honest limits at T2 (asserted as limits, not hidden)
+### 6.3 T3 closes the egress gap by composition
+
+At T2 egress is all-or-nothing: Seatbelt matches sockets, Landlock matches
+ports, neither matches hostnames. T3 fixes this by letting each layer do what it
+is actually good at:
+
+```
+kernel : deny ALL egress except one loopback port   (unforgeable)
+broker : accept there, enforce the host allowlist   (expressive)
+```
+
+The kernel half is what makes it a boundary rather than a politeness. Measured
+(`tools/probe/egress_probe.c`):
+
+| profile | `:8888` (broker) | `:9999` | `1.1.1.1:443` |
+|---|---|---|---|
+| `(deny default)` | EPERM | EPERM | EPERM |
+| `+ (allow network-outbound (remote ip "localhost:8888"))` | **CONNECT** | EPERM | EPERM |
+| `+ (allow network-outbound)` | refused | refused | CONNECTED |
+
+Row 2 is T3. A compromised child cannot open its own socket, so it cannot route
+around the allowlist — ignoring the `*_PROXY` variables yields no network at
+all, not a bypass.
+
+The broker enforces the allowlist on the **CONNECT authority**, then tunnels
+bytes opaquely. bastion never terminates TLS: there is no CA to install, no
+certificate trust to weaken, and no plaintext exposure. Refusals carry a remedy,
+like filesystem denials do (§4.1):
+
+```
+bastion: egress REFUSED cloudflare.com:443
+         remedy: bastion run --net cloudflare.com:443
+```
+
+Wildcards are supported (`*.example.com`) and deliberately do **not** match the
+bare apex — granting `*.example.com` should not silently include
+`example.com`. Host matching is case-insensitive, since DNS is.
+
+### 6.4 Honest limits that remain
 
 The suite asserts these as `LIMIT`, so the documented boundary can never drift
 from the enforced one:
 
-- **Egress is all-or-nothing.** Seatbelt filters sockets, not hostnames, so once
-  any `--net` grant exists, a connection to a non-allowlisted host succeeds.
-  Per-host allowlisting requires T3 (proxy interception). `bastion explain`
-  prints this warning; Landlock is the same, filtering by **port** only.
-- **Host processes are visible.** No PID namespace at T2; `ps aux` works. T3.
+- **T2 egress is all-or-nothing.** Use `--tier t3`. Asserted as a limit at T2
+  *and* asserted closed at T3, so the pair cannot silently diverge.
+- **Host processes are visible.** macOS offers no unprivileged PID namespace, so
+  `ps aux` works at T2 and T3 alike. That needs T4 (Virtualization.framework).
 - **T0/T1 are not boundaries** against a motivated adversary, and say so.
 
 ---

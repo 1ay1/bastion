@@ -5,8 +5,10 @@
 
 #include "bastion/policy.hpp"
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bastion {
@@ -26,6 +28,8 @@ struct SpawnRequest {
     bool wait = true;
 };
 
+struct EgressAttempt;  // proxy.hpp
+
 struct SpawnResult {
     int exit_code = -1;
     bool signalled = false;
@@ -35,6 +39,13 @@ struct SpawnResult {
     std::string profile;                   // exact policy applied, for auditing
     int pid = -1;                          // child pid
     int pgid = -1;                         // child process GROUP (== pid)
+
+    // T3 egress broker results. Populated when the policy is T3+ and carries
+    // network rules; these feed the audit ledger and `bastion synthesize`.
+    std::uint16_t proxy_port = 0;
+    std::uint64_t egress_allowed = 0;
+    std::uint64_t egress_denied = 0;
+    std::vector<std::pair<std::string, bool>> egress_attempts;  // host:port, allowed
 
     [[nodiscard]] bool launched() const noexcept { return error.empty(); }
 };
@@ -50,6 +61,13 @@ struct SpawnResult {
 // would confine bastion itself, and applying it after exec is impossible. If
 // step 3 fails we _exit() immediately with a distinguished code rather than
 // exec'ing unconfined — a failed sandbox must never degrade to no sandbox.
+//
+// At T3 with egress rules, spawn() owns an EgressProxy for the duration of the
+// run and pins the kernel policy to its port. Inspect it through
+// SpawnResult::egress_attempts / egress_allowed / egress_denied — passing your
+// own proxy in is deliberately not supported, because the port the child is
+// authorized to reach and the port the broker listens on must be the same by
+// construction, not by convention.
 [[nodiscard]] SpawnResult spawn(const Sealed& policy, const SpawnRequest& req);
 
 // Wait for a child previously started with `wait = false`, filling in the exit

@@ -12,7 +12,9 @@
 #include "bastion/policy.hpp"
 #include "bastion/tier.hpp"
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace bastion::darwin {
 
@@ -41,6 +43,10 @@ struct CompileResult {
 
 // Compile a sealed policy to SBPL.
 //
+// `proxy_port`, when non-zero and the policy is at T3+, pins egress to that
+// loopback port: the kernel denies all other outbound, and bastion's proxy
+// enforces the per-host allowlist there (see proxy.hpp).
+//
 // Encodes measured Seatbelt semantics (all verified in tools/probe):
 //   - `subpath` respects component boundaries: /x/normal does NOT match
 //     /x/normal-evil. Matches Sealed::covers(), so eval and enforcement agree.
@@ -48,13 +54,14 @@ struct CompileResult {
 //   - `literal` does NOT grant children; directory grants must use `subpath`.
 //   - traversal needs `file-read-metadata`: a rule naming a canonical path is
 //     EPERM when opened via a symlink without it (DESIGN.md §2.1).
-[[nodiscard]] CompileResult compile(const Sealed& policy);
+[[nodiscard]] CompileResult compile(const Sealed& policy,
+                                    std::uint16_t proxy_port = 0);
 
 // Apply the policy to the CURRENT process. Irreversible.
 // Returns empty on success, else an error message.
 //
 // Intended to be called in the child between fork() and exec().
-[[nodiscard]] std::string apply(const Sealed& policy);
+[[nodiscard]] std::string apply(const Sealed& policy, std::uint16_t proxy_port = 0);
 
 // Runtime capability probe — never inferred from build flags.
 [[nodiscard]] BackendCaps probe();

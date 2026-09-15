@@ -3,12 +3,13 @@
 Cross-platform sandboxing for AI agents, in modern type-theoretic C++23.
 
 **Status:** working sandbox on macOS. Capability algebra, tier model, policy
-evaluation, Seatbelt (T2) enforcement, spawn, T0 kernel observation, audit
-ledger, synthesizer and CLI are implemented and tested (11/11, incl. 27
-adversarial escape attempts and a closed observe→synthesize→enforce loop). The
-Landlock (T2/Linux) backend is written with ABI v1..v10 probing and its UAPI
-usage is typechecked in CI, but is **not yet run on a live kernel**. Windows
-AppContainer and T3/T4 are specified only (`DESIGN.md`).
+evaluation, Seatbelt (T2) enforcement, T3 brokered per-host egress, spawn, T0
+kernel observation, audit ledger, synthesizer and CLI are implemented and tested
+(12/12, incl. 29 adversarial escape attempts and a closed
+observe→synthesize→enforce loop). The Landlock (T2/Linux) backend is written
+with ABI v1..v10 probing and its UAPI usage is typechecked in CI, but is **not
+yet run on a live kernel**. Windows AppContainer and T4 are specified only
+(`DESIGN.md`).
 
 ## The problem this exists to fix
 
@@ -177,10 +178,10 @@ These claims are **verified, not asserted** — see below.
 
 ## Verified, not asserted
 
-Security claims are worth nothing unless CI checks them. `ctest` runs **11
+Security claims are worth nothing unless CI checks them. `ctest` runs **12
 suites**, all green on macOS 26.6.2 / arm64 / Apple clang 21.
 
-**27 real escape attempts, 0 escapes** (`tests/adversarial_test.cpp`) — symlink
+**29 real escape attempts, 0 escapes** (`tests/adversarial_test.cpp`) — symlink
 farms pointed at `/etc` and `/`, `../` traversal, sibling-prefix confusion,
 copying `sh` into the workspace to shed policy, `~/.ssh` + `~/.aws` + keychain +
 shell history, `DYLD_INSERT_LIBRARIES` injection, LaunchAgent persistence.
@@ -217,20 +218,57 @@ negative_compile_3 ... Passed   # copying a capability
 negative_compile_4 ... Passed   # laundering Unconfined in with normal rights
 ```
 
-### Honest limits at T2 (asserted as limits, so docs can't drift)
+### Honest limits (asserted as limits, so docs can't drift)
 
-- **Egress is all-or-nothing.** Seatbelt filters sockets, not hostnames;
-  Landlock filters by port. Per-host allowlisting needs T3. `bastion explain`
-  says so.
-- **Host processes are visible.** No PID namespace at T2.
+- **T2 egress is all-or-nothing** — use `--tier t3` (below). The limit is
+  asserted at T2 *and* asserted closed at T3, so the two can't diverge.
+- **Host processes are visible.** macOS has no unprivileged PID namespace, so
+  `ps aux` works at T2/T3. Needs T4.
 - **T0/T1 are not boundaries** against a motivated adversary, and say so.
+
+## T3: per-host network allowlisting
+
+No kernel can filter egress by hostname — Seatbelt matches sockets, Landlock
+matches ports. T3 composes the two layers so each does what it's good at:
+
+```
+kernel : deny ALL egress except one loopback port   (unforgeable)
+broker : accept there, enforce the host allowlist   (expressive)
+```
+
+```sh
+$ bastion run -t t3 --net example.com:443 -- curl -s https://example.com
+HTTP 200
+bastion: T3 egress broker on 127.0.0.1:56653 — direct outbound is kernel-denied.
+
+$ bastion run -t t3 --net example.com:443 -- curl -sS https://cloudflare.com
+curl: (56) CONNECT tunnel failed, response 403
+bastion: egress REFUSED cloudflare.com:443
+         remedy: bastion run --net cloudflare.com:443
+```
+
+The kernel half is what makes this a boundary and not a politeness — measured:
+
+| profile | `:8888` (broker) | `:9999` | `1.1.1.1:443` |
+|---|---|---|---|
+| `(deny default)` | EPERM | EPERM | EPERM |
+| `+ (allow network-outbound (remote ip "localhost:8888"))` | **CONNECT** | EPERM | EPERM |
+| `+ (allow network-outbound)` | refused | refused | CONNECTED |
+
+A compromised child can't open its own socket, so ignoring the `*_PROXY`
+variables gets it *no network*, not a bypass. The adversarial suite proves both
+halves: non-allowlisted host refused, and raw `nc` to `1.1.1.1:443` kernel-denied.
+
+bastion enforces on the **CONNECT authority** and tunnels bytes opaquely — TLS
+is never terminated, so there's no CA to install and no plaintext exposure.
+Wildcards (`*.example.com`) work and deliberately don't match the bare apex.
 
 ## Build
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-(cd build && ctest --output-on-failure)     # 11/11
+(cd build && ctest --output-on-failure)     # 12/12
 
 ./tools/demo.sh                            # end-to-end CLI walkthrough
 ```

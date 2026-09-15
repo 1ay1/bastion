@@ -9,11 +9,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 
 #if defined(__APPLE__)
 #  include <crt_externs.h>
 #  define BASTION_ENVIRON (*_NSGetEnviron())
 #  include "bastion/backend/seatbelt.hpp"
+#  include "bastion/proxy.hpp"
 // Declared at file scope: sandbox_init(3) has no public SDK header.
 extern "C" int sandbox_init(const char* profile, uint64_t flags, char** errorbuf);
 #else
@@ -158,7 +160,33 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     }
 
 #if defined(__APPLE__)
-    auto compiled = darwin::compile(policy);
+    // T3: stand up the egress broker BEFORE compiling, so the profile can pin
+    // outbound to its loopback port. Without the proxy running first there is
+    // no port to authorize, and the child would be left with no egress at all.
+    std::unique_ptr<EgressProxy> proxy;
+    std::uint16_t proxy_port = 0;
+    if (policy.tier() >= Tier::Isolate && !policy.is_unconfined()) {
+        std::vector<EgressRule> allow;
+        for (const auto& r : policy.rules()) {
+            if (any(r.right & (Right::NetEgress | Right::NetBind))) {
+                allow.push_back(parse_egress_rule(r.scope));
+            }
+        }
+        if (!allow.empty()) {
+            std::string perr;
+            proxy = EgressProxy::start(std::move(allow), perr);
+            if (!proxy) {
+                out.error = "T3 requires the egress proxy, which failed to "
+                            "start: " + perr +
+                            " (refusing to run with unrestricted egress)";
+                return out;  // fail closed
+            }
+            proxy_port = proxy->port();
+            out.proxy_port = proxy_port;
+        }
+    }
+
+    auto compiled = darwin::compile(policy, proxy_port);
     if (!compiled.ok) {
         out.error = "policy compilation failed: " + compiled.error;
         return out;  // fail closed: never launch with a broken policy
@@ -186,6 +214,24 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         }
     }
     for (const auto& kv : req.env) env_storage.push_back(kv);
+
+#if defined(__APPLE__)
+    // Point the child at the broker. Every mainstream HTTP client honours
+    // these, so tools work unmodified -- and it does not matter if one does
+    // not: the kernel has already denied every other route out, so ignoring
+    // the variables means no network rather than a bypass.
+    if (proxy_port != 0) {
+        const std::string url =
+            "http://127.0.0.1:" + std::to_string(proxy_port);
+        for (const char* k : {"HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
+                              "https_proxy", "ALL_PROXY", "all_proxy"}) {
+            env_storage.push_back(std::string{k} + "=" + url);
+        }
+        env_storage.emplace_back("NO_PROXY=");
+        env_storage.emplace_back("no_proxy=");
+        env_storage.push_back("BASTION_PROXY_PORT=" + std::to_string(proxy_port));
+    }
+#endif
 
     std::vector<char*> cargv;
     cargv.reserve(req.argv.size() + 1);
@@ -250,6 +296,26 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     if (!req.wait) return out;  // caller will spawn_wait() later
 
     spawn_wait(out);
+
+#if defined(__APPLE__)
+    // Harvest the broker's ledger before it is torn down. Every egress
+    // decision the workload triggered is reported to the caller, so a T3 run
+    // is as auditable as a filesystem one.
+    if (proxy) {
+        out.egress_allowed = proxy->allowed_count();
+        out.egress_denied = proxy->denied_count();
+        for (const auto& a : proxy->take_attempts()) {
+            out.egress_attempts.emplace_back(
+                a.host + ":" + std::to_string(a.port), a.allowed);
+        }
+        if (out.egress_denied > 0) {
+            out.warnings.push_back(
+                std::to_string(out.egress_denied) +
+                " egress attempt(s) were REFUSED by the allowlist");
+        }
+        proxy->stop();
+    }
+#endif
     return out;
 }
 

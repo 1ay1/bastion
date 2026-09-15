@@ -60,8 +60,13 @@ USAGE
 POLICY OPTIONS
   -w, --workspace PATH   read+write grant (default: current directory)
   -r, --read PATH        read-only grant
-      --net HOST:PORT    allow egress to a host:port
+      --net HOST:PORT    allow egress to a host:port (wildcards: *.example.com)
   -t, --tier TIER        t0|t1|t2|t3  (default: t2)
+
+  At t3, --net becomes a REAL per-host allowlist: the kernel denies all direct
+  egress and bastion brokers connections on loopback, so a compromised child
+  cannot route around it. At t2, --net is all-or-nothing (the kernel matches
+  sockets, not hostnames) and bastion says so rather than implying otherwise.
 
   --yolo                 grant Unconfined: no restriction is enforced.
                          NOT the same as disabling bastion — the audit ledger
@@ -83,7 +88,10 @@ EXAMPLES
   bastion synthesize > bastion.toml
 
   # Wide open because you're in a hurry — still recorded:
-  bastion run --yolo -- ./weird-legacy-build.sh)");
+  bastion run --yolo -- ./weird-legacy-build.sh
+
+  # Real per-host network allowlisting:
+  bastion run -t t3 --net '*.githubusercontent.com:443' -- pip install -r reqs.txt)");
 }
 
 Tier parse_tier(std::string_view s, bool& ok) {
@@ -312,8 +320,22 @@ int cmd_run(const Args& a) {
     req.argv = a.argv;
     auto result = spawn(policy, req);
 
+    if (result.proxy_port != 0) {
+        std::fprintf(stderr,
+                     "bastion: T3 egress broker on 127.0.0.1:%u — direct "
+                     "outbound is kernel-denied.\n",
+                     result.proxy_port);
+    }
     for (const auto& w : result.warnings) {
         std::fprintf(stderr, "bastion: [warning] %s\n", w.c_str());
+    }
+    for (const auto& [hostport, allowed] : result.egress_attempts) {
+        if (!allowed) {
+            std::fprintf(stderr,
+                         "bastion: egress REFUSED %s\n"
+                         "         remedy: bastion run --net %s\n",
+                         hostport.c_str(), hostport.c_str());
+        }
     }
     if (!result.launched()) {
         std::fprintf(stderr, "bastion: %s\n", result.error.c_str());

@@ -58,7 +58,7 @@ std::string validate_path(std::string_view path) {
     return {};
 }
 
-CompileResult compile(const Sealed& policy) {
+CompileResult compile(const Sealed& policy, std::uint16_t proxy_port) {
     CompileResult res;
     std::ostringstream o;
 
@@ -233,11 +233,22 @@ CompileResult compile(const Sealed& policy) {
         }
     }
 
-    // Seatbelt cannot filter egress by hostname -- only by socket/port. Rather
-    // than pretend, we grant socket egress and warn loudly. Host-level
-    // allowlisting requires T3 (proxy interception); saying so is the point
-    // (DESIGN.md §6: `bastion explain` prints the REAL boundary).
-    if (any_egress) {
+    // Seatbelt cannot filter egress by hostname -- only by socket/address.
+    //
+    // T3 closes that gap by composition: the kernel denies ALL egress except
+    // one loopback port, and bastion's proxy listens there and enforces the
+    // per-host allowlist. Measured (tools/probe/egress_probe.c): with only
+    // `(remote ip "localhost:PORT")` allowed, the proxy port CONNECTs while
+    // every other port and all direct egress return EPERM -- so the proxy is
+    // not a politeness the workload can route around, it is the only way out.
+    if (any_egress && policy.tier() >= Tier::Isolate && proxy_port != 0) {
+        const std::string p = std::to_string(proxy_port);
+        o << ";; T3: egress is pinned to the bastion proxy on loopback.\n"
+          << ";; Direct outbound is denied by the kernel; the proxy enforces\n"
+          << ";; the per-host allowlist.\n"
+          << "(allow network-outbound (remote ip \"localhost:" << p << "\"))\n"
+          << "(allow file-read* (subpath \"/private/etc\"))\n";
+    } else if (any_egress) {
         o << ";; NOTE: Seatbelt filters sockets, not hostnames.\n"
           << "(allow network-outbound)\n"
           << "(allow network-bind (local ip \"localhost:*\"))\n"
@@ -245,7 +256,7 @@ CompileResult compile(const Sealed& policy) {
           << "(allow file-read* (subpath \"/private/etc\"))\n";  // resolv.conf
         res.warnings.emplace_back(
             "net.egress granted, but Seatbelt cannot restrict by hostname: ALL "
-            "outbound connections are permitted at T2. Use T3 (proxy) for "
+            "outbound connections are permitted at T2. Use --tier t3 for "
             "per-host allowlisting.");
     }
 
@@ -274,14 +285,21 @@ BackendCaps probe() {
     BackendCaps c;
     c.name = "seatbelt";
     c.fs_path_authority = (&sandbox_init != nullptr);
-    c.net_egress_filter = false;  // sockets only, not hostnames -- be honest
+    // Per-host egress filtering IS available, but only at T3: the kernel pins
+    // outbound to a loopback port and bastion's broker enforces the allowlist
+    // there. At T2 alone Seatbelt matches sockets, not hostnames.
+    c.net_egress_filter = c.fs_path_authority;
     c.device_control = false;
-    c.namespace_isolation = false;
+    c.namespace_isolation = false;  // no PID/IPC namespaces on macOS
     c.requires_setuid = false;
-    c.max_tier = c.fs_path_authority ? Tier::Kernel : Tier::Advisory;
+    // T3 here means "kernel enforcement + brokered egress". It does NOT mean
+    // namespace isolation, which macOS does not offer unprivileged; that is
+    // T4's job via Virtualization.framework.
+    c.max_tier = c.fs_path_authority ? Tier::Isolate : Tier::Advisory;
     c.version_note =
         "sandbox_init(3), weak-linked. sandbox-exec(1) is deprecated but the "
-        "underlying API is verified working on macOS 26.x.";
+        "underlying API is verified working on macOS 26.x. T3 = kernel-pinned "
+        "egress via the loopback broker (no PID/IPC namespaces on macOS).";
     return c;
 }
 
