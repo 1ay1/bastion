@@ -18,6 +18,12 @@ struct SpawnRequest {
                                       // so there is no fixed sandbox root.
     std::vector<std::string> env;     // "K=V"; if empty, a sanitized env is built
     bool inherit_env = false;
+
+    // When false, spawn() returns as soon as the child is running instead of
+    // waiting for it. Required by T0 observation: audit records must be drained
+    // and attributed WHILE the subtree is alive, because getpgid() cannot
+    // resolve a process that has already exited.
+    bool wait = true;
 };
 
 struct SpawnResult {
@@ -27,6 +33,8 @@ struct SpawnResult {
     std::string error;                     // non-empty => failed to launch
     std::vector<std::string> warnings;     // rights not enforceable here
     std::string profile;                   // exact policy applied, for auditing
+    int pid = -1;                          // child pid
+    int pgid = -1;                         // child process GROUP (== pid)
 
     [[nodiscard]] bool launched() const noexcept { return error.empty(); }
 };
@@ -43,6 +51,10 @@ struct SpawnResult {
 // step 3 fails we _exit() immediately with a distinguished code rather than
 // exec'ing unconfined — a failed sandbox must never degrade to no sandbox.
 [[nodiscard]] SpawnResult spawn(const Sealed& policy, const SpawnRequest& req);
+
+// Wait for a child previously started with `wait = false`, filling in the exit
+// status fields of `result`.
+void spawn_wait(SpawnResult& result);
 
 // Build a sanitized environment that satisfies the ergonomic floor (DESIGN.md
 // §4): TMPDIR inside a writable location, toolchain caches, a coherent PATH.

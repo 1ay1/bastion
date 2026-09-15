@@ -64,6 +64,22 @@ CompileResult compile(const Sealed& policy) {
 
     o << "(version 1)\n";
 
+    // T0 observation: allow everything, but make the kernel REPORT each access
+    // decision to the unified log so `bastion synthesize` has real evidence.
+    // Measured on macOS 26.6.2: `(allow default (with report))` yields lines like
+    //   Sandbox: sh(123) allow file-read-data /private/etc/hosts
+    // unprivileged -- no root, no fs_usage, no dtrace (both need privileges we
+    // refuse to ask for). Paths arrive canonicalized, which is what we want.
+    if (policy.is_report_all()) {
+        o << ";; T0 OBSERVE: no enforcement, full reporting.\n"
+          << "(allow default (with report))\n";
+        res.profile = o.str();
+        res.ok = true;
+        res.warnings.emplace_back(
+            "T0 observe: nothing is enforced; every access is recorded");
+        return res;
+    }
+
     // An Unconfined policy still produces a real, valid profile: we allow
     // everything rather than skipping enforcement, so that the SAME code path
     // runs at every tier (DESIGN.md §1) and the audit ledger stays authoritative.

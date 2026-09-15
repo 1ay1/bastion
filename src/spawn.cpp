@@ -217,6 +217,12 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // calls past this point; no allocation, no iostreams.
         if (cwd && ::chdir(cwd) != 0) _exit(kExitChdirFailed);
 
+        // Own process group, so the ENTIRE subtree (children, grandchildren,
+        // anything exec'd) shares one pgid. T0 observation filters audit
+        // records on this; without it, attribution has to guess by process
+        // name and loses every grandchild's accesses.
+        ::setpgid(0, 0);
+
         // Drop inherited descriptors BEFORE confining. An fd opened by the
         // parent carries its own access rights past the sandbox boundary
         // (measured -- see close_inherited_fds), so leaving one open would
@@ -235,11 +241,27 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     }
 
     // ---- parent ------------------------------------------------------------
+    out.pid = static_cast<int>(pid);
+    out.pgid = static_cast<int>(pid);  // setpgid(0,0) in the child => pgid == pid
+    // Also set it from the parent to close the race where the child has not yet
+    // run setpgid but the observer is already reading audit lines.
+    ::setpgid(pid, pid);
+
+    if (!req.wait) return out;  // caller will spawn_wait() later
+
+    spawn_wait(out);
+    return out;
+}
+
+void spawn_wait(SpawnResult& out) {
+    if (out.pid <= 0) return;
+    const pid_t pid = static_cast<pid_t>(out.pid);
+
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
             out.error = std::string{"waitpid failed: "} + std::strerror(errno);
-            return out;
+            return;
         }
     }
 
@@ -247,7 +269,7 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         out.signalled = true;
         out.signal_number = WTERMSIG(status);
         out.exit_code = 128 + out.signal_number;
-        return out;
+        return;
     }
 
     out.exit_code = WEXITSTATUS(status);
@@ -265,7 +287,6 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         default:
             break;
     }
-    return out;
 }
 
 }  // namespace bastion

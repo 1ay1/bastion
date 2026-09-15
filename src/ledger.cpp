@@ -54,6 +54,35 @@ std::string rights_to_cpp(Right r) {
     return s.empty() ? "Right::None" : s;
 }
 
+// Paths that the backend's ergonomic floor already covers. Emitting rules for
+// these bloats a synthesized policy with noise (dyld, locale tables, /bin/sh
+// itself) and hides the handful of grants that actually matter.
+//
+// Observation sees EVERYTHING a process touches, including all the machinery
+// the base profile grants anyway -- 48 raw records for a shell that read one
+// file. Filtering here is what makes the output reviewable.
+bool covered_by_floor(std::string_view op, std::string_view path) {
+    if (op == "fs.stat") return true;  // traversal metadata, always granted
+
+    static constexpr std::string_view kFloorRead[] = {
+        "/usr/lib", "/usr/share", "/System", "/Library/Preferences",
+        "/private/var/db/dyld", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        "/private/var/select", "/Library/Developer", "/Applications/Xcode.app",
+        "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", "/dev/tty",
+        "/dev/dtracehelper", "/dev/fd", "/dev/stdout", "/dev/stderr",
+        "/dev/stdin", "/dev/ptmx", "/dev/console",
+    };
+    for (auto f : kFloorRead) {
+        if (path == f) return true;
+        if (path.size() > f.size() && path.starts_with(f) && path[f.size()] == '/') {
+            return true;
+        }
+    }
+    // /dev/ttysNNN and similar.
+    if (path.starts_with("/dev/ttys")) return true;
+    return false;
+}
+
 }  // namespace
 
 void Ledger::record(const AuditRecord& rec) { records_.push_back(rec); }
@@ -133,6 +162,19 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
         Right rr = right_for_op(r.op);
         if (rr == Right::None) continue;
         if (r.target.empty() || r.target == "*") continue;
+
+        // The root directory is granted by the base profile (dyld reads it).
+        // A synthesized `fs.read /` would hand over the ENTIRE filesystem --
+        // the exact opposite of least privilege. Observation legitimately sees
+        // this access, so it must be filtered here rather than trusted.
+        if (r.target == "/") {
+            ++syn.floor_filtered;
+            continue;
+        }
+        if (covered_by_floor(r.op, r.target)) {
+            ++syn.floor_filtered;
+            continue;
+        }
         need[std::to_underlying(rr)].insert(r.target);
     }
 
@@ -191,10 +233,16 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
 std::string Synthesis::to_toml() const {
     std::ostringstream o;
     o << "# Synthesized by `bastion synthesize` from " << observations
-      << " observed operation(s).\n"
-      << "# This is the MINIMAL policy that would have allowed everything the\n"
-      << "# program actually did. Review before committing.\n\n"
-      << "tier = \"T2\"\n\n";
+      << " observed operation(s).\n";
+    if (floor_filtered > 0) {
+        o << "# " << floor_filtered
+          << " access(es) omitted: already covered by the ergonomic floor\n"
+          << "# (dyld, locale data, /bin, /dev/null, traversal metadata, ...).\n";
+    }
+    o << "# This is the MINIMAL policy that would have allowed everything the\n"
+      << "# program actually did. Review before committing.\n\n";
+
+    if (!rules.empty()) o << "tier = \"T2\"\n\n";
 
     for (const auto& note : notes) o << "# NOTE: " << note << "\n";
     if (!notes.empty()) o << "\n";
@@ -206,8 +254,30 @@ std::string Synthesis::to_toml() const {
           << "why   = \"" << r.provenance << "\"\n\n";
     }
     if (rules.empty()) {
-        o << "# No grants needed: the program touched nothing outside the\n"
-          << "# ergonomic floor. You can run this at T2 with no rules at all.\n";
+        // NEVER claim a workload needs nothing just because we recorded
+        // nothing. The original version of this code printed "No grants
+        // needed" for a program that had demonstrably read /etc/hosts and
+        // written /tmp -- a confident, wrong answer, which is worse than no
+        // answer. If there is no filesystem/network evidence, say so and point
+        // at the command that produces it.
+        o << "# !! NO ACCESS EVIDENCE IN THE LEDGER.\n"
+          << "#\n"
+          << "# This is NOT the same as \"the program needs no permissions\".\n";
+        if (observations > 0) {
+            o << "# The ledger holds " << observations
+              << " record(s), but none of them are file or network\n"
+              << "# accesses -- `bastion run` records that a process was\n"
+              << "# spawned, not what it touched.\n";
+        }
+        o << "#\n"
+          << "# To collect real evidence, run the workload under observation:\n"
+          << "#\n"
+          << "#     bastion observe -- <your command>\n"
+          << "#     bastion synthesize\n"
+          << "#\n"
+          << "# Refusing to emit a policy that would look tight but was\n"
+          << "# derived from nothing.\n";
+        return o.str();
     }
     return o.str();
 }

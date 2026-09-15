@@ -72,6 +72,21 @@ public:
         return std::move(*this);
     }
 
+    // T0 observation: allow everything, but ask the kernel to REPORT every
+    // access decision so we can learn what the workload truly needs.
+    //
+    // This is not a grant of authority in the capability sense -- nothing is
+    // enforced at T0 by definition -- it is an instruction to the backend to
+    // emit an audit record per decision. It exists because a synthesizer that
+    // cannot observe is a synthesizer that lies (see observe.hpp).
+    [[nodiscard]] Policy allow_report_all(std::string why) && {
+        report_all_ = true;
+        tier_ = Tier::Observe;
+        rules_.push_back(Rule{Right::Unconfined, "*", "T0 observe: " + why});
+        unconfined_ = true;
+        return std::move(*this);
+    }
+
     // ---- The bypass, as a capability rather than a power switch -----------
     //
     // This is what `--yolo` / `--dangerously-skip-permissions` maps to. Note
@@ -90,12 +105,14 @@ public:
     [[nodiscard]] Tier tier() const noexcept { return tier_; }
     [[nodiscard]] const std::vector<Rule>& rules() const noexcept { return rules_; }
     [[nodiscard]] bool is_unconfined() const noexcept { return unconfined_; }
+    [[nodiscard]] bool is_report_all() const noexcept { return report_all_; }
 
 private:
     friend class Sealed;
     Tier tier_;
     std::vector<Rule> rules_;
     bool unconfined_ = false;
+    bool report_all_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -107,6 +124,7 @@ public:
     [[nodiscard]] Tier tier() const noexcept { return tier_; }
     [[nodiscard]] const std::vector<Rule>& rules() const noexcept { return rules_; }
     [[nodiscard]] bool is_unconfined() const noexcept { return unconfined_; }
+    [[nodiscard]] bool is_report_all() const noexcept { return report_all_; }
 
     // Evaluate without enforcing. Identical code path at every tier — this is
     // the mechanism behind "lowering a tier never lowers observability", and
@@ -121,16 +139,17 @@ public:
 
 private:
     friend class Policy;
-    Sealed(Tier t, std::vector<Rule> r, bool unconf)
-        : tier_(t), rules_(std::move(r)), unconfined_(unconf) {}
+    Sealed(Tier t, std::vector<Rule> r, bool unconf, bool report)
+        : tier_(t), rules_(std::move(r)), unconfined_(unconf), report_all_(report) {}
 
     Tier tier_;
     std::vector<Rule> rules_;
     bool unconfined_;
+    bool report_all_ = false;
 };
 
 inline Sealed Policy::seal() && {
-    return Sealed{tier_, std::move(rules_), unconfined_};
+    return Sealed{tier_, std::move(rules_), unconfined_, report_all_};
 }
 
 }  // namespace bastion

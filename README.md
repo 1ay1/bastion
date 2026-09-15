@@ -3,8 +3,9 @@
 Cross-platform sandboxing for AI agents, in modern type-theoretic C++23.
 
 **Status:** working sandbox on macOS. Capability algebra, tier model, policy
-evaluation, Seatbelt (T2) enforcement, spawn, audit ledger, synthesizer and CLI
-are implemented and tested (10/10, incl. 27 adversarial escape attempts). The
+evaluation, Seatbelt (T2) enforcement, spawn, T0 kernel observation, audit
+ledger, synthesizer and CLI are implemented and tested (11/11, incl. 27
+adversarial escape attempts and a closed observe→synthesize→enforce loop). The
 Landlock (T2/Linux) backend is written with ABI v1..v10 probing and its UAPI
 usage is typechecked in CI, but is **not yet run on a live kernel**. Windows
 AppContainer and T3/T4 are specified only (`DESIGN.md`).
@@ -73,8 +74,36 @@ guarantee: Kernel-enforced path-set authority. Survives arbitrary native code.
 ```
 
 Because a wide-open session is still fully recorded, **the bypass is the on-ramp
-to a tight policy**: run unconfined for a week, then `bastion synthesize` the
-minimal policy that would have sufficed.
+to a tight policy**. And you don't have to guess what a workload needs — watch it:
+
+```sh
+$ bastion observe -- ./weird-legacy-build.sh
+bastion: T0 OBSERVE via seatbelt-report+unified-log — nothing is enforced,
+         every access is recorded. Ctrl-C is safe.
+bastion: recorded 62 access(es)
+         next: bastion synthesize
+
+$ bastion synthesize
+# Synthesized by `bastion synthesize` from 62 observed operation(s).
+# 48 access(es) omitted: already covered by the ergonomic floor
+# (dyld, locale data, /bin, /dev/null, traversal metadata, ...).
+tier = "T2"
+
+[[allow]]
+op    = "fs.read"
+path  = "/private/etc/hosts"
+...
+```
+
+On macOS this is real kernel observation, unprivileged: Seatbelt's
+`(allow default (with report))` makes the kernel emit an audit record per access
+decision, which bastion reads back from the unified log. No root, no `fs_usage`,
+no `dtrace` — both of those need privileges a sandbox has no business asking for.
+
+**The loop is closed, and CI proves it** (`tests/closed_loop_test.cpp`): observe a
+workload → synthesize → **re-run under the derived policy** → it must succeed,
+while paths it never touched stay denied. A synthesizer whose output is never
+executed is just a plausible-looking text generator.
 
 ## Run in any directory (no fixed `$HOME/sandbox`, no symlink farm)
 
@@ -148,7 +177,7 @@ These claims are **verified, not asserted** — see below.
 
 ## Verified, not asserted
 
-Security claims are worth nothing unless CI checks them. `ctest` runs **10
+Security claims are worth nothing unless CI checks them. `ctest` runs **11
 suites**, all green on macOS 26.6.2 / arm64 / Apple clang 21.
 
 **27 real escape attempts, 0 escapes** (`tests/adversarial_test.cpp`) — symlink
@@ -201,7 +230,7 @@ negative_compile_4 ... Passed   # laundering Unconfined in with normal rights
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-(cd build && ctest --output-on-failure)     # 10/10
+(cd build && ctest --output-on-failure)     # 11/11
 
 ./tools/demo.sh                            # end-to-end CLI walkthrough
 ```
@@ -212,6 +241,10 @@ cmake --build build
 # Tight, in whatever directory you're already in:
 bastion run -- cargo test
 
+# Don't know what it needs? Watch it, then lock it down from evidence:
+bastion observe -- ./weird-legacy-build.sh
+bastion synthesize > bastion.toml
+
 # See the REAL boundary, including what the backend can't enforce:
 bastion explain -w . --net api.example.com:443
 
@@ -220,7 +253,6 @@ bastion doctor
 
 # Wide open because you're in a hurry -- still fully recorded:
 bastion run --yolo -- ./weird-legacy-build.sh
-bastion synthesize > bastion.toml    # now lock it down, from evidence
 ```
 
 ## Non-goals

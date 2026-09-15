@@ -66,6 +66,7 @@ struct Synthesis {
     std::vector<std::string> notes;
     std::size_t observations = 0;
     std::size_t denials_seen = 0;
+    std::size_t floor_filtered = 0;  // accesses the ergonomic floor covers
 
     // Render as a policy file the user can review, edit and commit.
     [[nodiscard]] std::string to_toml() const;

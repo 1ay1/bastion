@@ -5,6 +5,7 @@
 // full ledger they can turn into a tight policy with `bastion synthesize`.
 // Nobody is ever told "you're on your own".
 #include "bastion/ledger.hpp"
+#include "bastion/observe.hpp"
 #include "bastion/spawn.hpp"
 
 #include <cstdio>
@@ -51,6 +52,7 @@ void print_usage() {
 
 USAGE
   bastion run [OPTIONS] -- <command>...    run a command under a policy
+  bastion observe -- <command>...          run unconfined, RECORD every access
   bastion explain [OPTIONS]                print the REAL enforced boundary
   bastion doctor                           check backend + ergonomic floor
   bastion synthesize [--ledger PATH]       turn a session log into a policy
@@ -76,9 +78,12 @@ EXAMPLES
   # Tight, in whatever directory you happen to be in:
   bastion run -- cargo test
 
+  # Don't know what it needs? Watch it, then lock it down:
+  bastion observe -- ./weird-legacy-build.sh
+  bastion synthesize > bastion.toml
+
   # Wide open because you're in a hurry — still recorded:
-  bastion run --yolo -- ./weird-legacy-build.sh
-  bastion synthesize > bastion.toml     # now lock it down from evidence)");
+  bastion run --yolo -- ./weird-legacy-build.sh)");
 }
 
 Tier parse_tier(std::string_view s, bool& ok) {
@@ -335,6 +340,51 @@ int cmd_run(const Args& a) {
     return result.exit_code;
 }
 
+int cmd_observe(const Args& a) {
+    if (a.argv.empty()) {
+        std::fputs("error: no command given (use `--` before it)\n", stderr);
+        return 2;
+    }
+    auto caps = observe_probe();
+    if (!caps.available) {
+        std::fprintf(stderr, "error: %s\n", caps.reason.c_str());
+        return 2;
+    }
+
+    std::fprintf(stderr,
+                 "bastion: T0 OBSERVE via %s — nothing is enforced, every\n"
+                 "         access is recorded. Ctrl-C is safe.\n",
+                 caps.mechanism.c_str());
+
+    SpawnRequest req;
+    req.argv = a.argv;
+    auto res = observe(req);
+
+    for (const auto& w : res.warnings) {
+        std::fprintf(stderr, "bastion: [warning] %s\n", w.c_str());
+    }
+    if (!res.ok()) {
+        std::fprintf(stderr, "bastion: %s\n", res.error.c_str());
+        return 2;
+    }
+
+    if (!a.no_ledger) {
+        Ledger led{a.ledger};
+        for (const auto& r : res.records) led.record(r);
+        if (auto err = led.flush(); !err.empty()) {
+            std::fprintf(stderr, "bastion: [warning] ledger: %s\n", err.c_str());
+        }
+    }
+
+    std::fprintf(stderr,
+                 "\nbastion: recorded %zu access(es)"
+                 "%s\n         next: bastion synthesize%s\n",
+                 res.records.size(),
+                 res.dropped ? " (ignored other processes)" : "",
+                 a.no_ledger ? " (note: --no-ledger, nothing was saved)" : "");
+    return res.exit_code;
+}
+
 int cmd_synthesize(const Args& a) {
     std::string err;
     auto led = Ledger::load(a.ledger, err);
@@ -363,6 +413,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (a.cmd == "run")        return cmd_run(a);
+    if (a.cmd == "observe")    return cmd_observe(a);
     if (a.cmd == "explain")    return cmd_explain(a);
     if (a.cmd == "doctor")     return cmd_doctor();
     if (a.cmd == "synthesize") return cmd_synthesize(a);

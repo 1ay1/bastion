@@ -26,7 +26,7 @@ else()
 endif()
 message(STATUS "bastion: platform backend = ${BASTION_PLATFORM}")
 
-set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp)
+set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp src/observe.cpp)
 if(APPLE)
     list(APPEND BASTION_SOURCES src/backend/seatbelt.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -84,6 +84,14 @@ if(BASTION_BUILD_TESTS)
     add_executable(adversarial_test tests/adversarial_test.cpp)
     target_link_libraries(adversarial_test PRIVATE bastion)
     add_test(NAME adversarial COMMAND adversarial_test)
+
+    # CLOSED LOOP: observe -> synthesize -> re-run under the derived policy.
+    # Proves `bastion synthesize` emits a policy that actually WORKS, rather
+    # than one that merely looks plausible.
+    add_executable(closed_loop_test tests/closed_loop_test.cpp)
+    target_link_libraries(closed_loop_test PRIVATE bastion)
+    add_test(NAME closed_loop COMMAND closed_loop_test)
+    set_tests_properties(closed_loop PROPERTIES TIMEOUT 120)
 
     # Verify the Landlock backend's UAPI usage even when not on Linux.
     add_test(NAME landlock_uapi
