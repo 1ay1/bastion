@@ -1,6 +1,7 @@
 #include "bastion/spawn.hpp"
 
 #include <spawn.h>
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -37,6 +38,25 @@ namespace {
 constexpr int kExitSandboxFailed = 126;
 constexpr int kExitChdirFailed = 125;
 constexpr int kExitExecFailed = 127;
+
+// Which setup step failed, reported over a CLOEXEC pipe rather than inferred
+// from the exit status.
+//
+// MEASURED: exit-code signalling alone is AMBIGUOUS and reports false escapes.
+// A POSIX shell exits 126 for "found but not executable" and 127 for "not
+// found" -- exactly the codes above. So a *correctly confined* child that
+// tried to exec a binary Landlock denied came back as "bastion failed to apply
+// the policy", turning a successful block into a reported failure
+// (tests/adversarial_test.cpp §4, "exec a copied shell to shed policy").
+//
+// The pipe is unambiguous: it carries a byte ONLY if bastion's own setup
+// failed, and execve() closes it silently on success (O_CLOEXEC), so EOF
+// means "the child really started".
+enum class ChildStage : unsigned char {
+    Chdir = 1,
+    Sandbox = 2,
+    Exec = 3,
+};
 
 // Pick a working directory the child actually has authority to read.
 //
@@ -103,7 +123,11 @@ bool is_dangerous_env(std::string_view kv) {
 // the range rather than trusting every caller to set O_CLOEXEC everywhere.
 //
 // Async-signal-safe: only close(2) and getrlimit-derived arithmetic.
-void close_inherited_fds() {
+//
+// `keep` is spared: it is bastion's own CLOEXEC status pipe, which must survive
+// until execve() closes it (that closure is the success signal). It is not an
+// inherited descriptor -- we created it -- and it is write-only to the parent.
+void close_inherited_fds(int keep = -1) {
     int max_fd = -1;
     struct rlimit rl {};
     if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
@@ -111,6 +135,7 @@ void close_inherited_fds() {
     }
     if (max_fd < 0 || max_fd > 65536) max_fd = 65536;  // sane cap
     for (int fd = STDERR_FILENO + 1; fd < max_fd; ++fd) {
+        if (fd == keep) continue;
         ::close(fd);  // EBADF is fine and expected
     }
 }
@@ -132,8 +157,23 @@ std::vector<std::string> sanitized_env(const Sealed& policy) {
     // win was "the return of rw in /tmp ... LLMs will stop going around in
     // circles", so TMPDIR pointing at a writable location is asserted here
     // rather than left to chance.
-    const char* tmp = getenv_or("TMPDIR", "/tmp");
-    env.emplace_back(std::string{"TMPDIR="} + tmp);
+    //
+    // It must point at a directory the policy actually GRANTS. On Linux the
+    // backend refuses to grant shared world-readable /tmp (it would leak
+    // between agents on the same box -- measured as 6 adversarial escapes) and
+    // mints a private per-run dir instead, so TMPDIR has to name that one.
+    // Defaulting to "/tmp" here would hand the toolchain a path the kernel
+    // denies, which is the "broken compiler" failure §4 exists to prevent.
+    std::string tmp = getenv_or("TMPDIR", "");
+#if defined(__linux__)
+    if (tmp.empty() && !policy.is_unconfined()) tmp = linux_ll::private_tmp_dir();
+#endif
+    if (tmp.empty()) tmp = "/tmp";
+    env.emplace_back("TMPDIR=" + tmp);
+    // Some toolchains read TMP/TEMP instead; keep all three consistent so the
+    // scratch dir is the granted one no matter which name is consulted.
+    env.emplace_back("TMP=" + tmp);
+    env.emplace_back("TEMP=" + tmp);
 
     // Toolchain caches must be writable AND persistent across runs, or every
     // build re-downloads the world and the agent looks broken.
@@ -287,9 +327,35 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
                 : (policy.is_unconfined() ? std::string{} : choose_cwd(policy));
     const char* cwd = cwd_storage.empty() ? nullptr : cwd_storage.c_str();
 
+    // Status pipe: the child writes one ChildStage byte if ITS OWN setup fails.
+    // O_CLOEXEC means a successful execve closes it without a write, so the
+    // parent reads EOF and knows the workload really started -- no inference
+    // from an exit code the workload itself can produce.
+    int status_pipe[2] = {-1, -1};
+#if defined(__linux__)
+    // pipe2 sets CLOEXEC atomically: with pipe()+fcntl() a concurrent fork in
+    // another thread could inherit the not-yet-CLOEXEC write end and hold it
+    // open, and the parent would then block forever waiting for an EOF.
+    const bool pipe_ok = ::pipe2(status_pipe, O_CLOEXEC) == 0;
+#else
+    // macOS has no pipe2(2); the fcntl window is accepted (bastion does not
+    // fork from multiple threads) and is still far better than inferring
+    // confinement failure from an exit code the workload controls.
+    const bool pipe_ok =
+        ::pipe(status_pipe) == 0 &&
+        ::fcntl(status_pipe[0], F_SETFD, FD_CLOEXEC) == 0 &&
+        ::fcntl(status_pipe[1], F_SETFD, FD_CLOEXEC) == 0;
+#endif
+    if (!pipe_ok) {
+        out.error = std::string{"status pipe failed: "} + std::strerror(errno);
+        return out;
+    }
+
     pid_t pid = ::fork();
     if (pid < 0) {
         out.error = std::string{"fork failed: "} + std::strerror(errno);
+        ::close(status_pipe[0]);
+        ::close(status_pipe[1]);
         return out;
     }
 
@@ -297,7 +363,20 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // ---- child ---------------------------------------------------------
         // Ordering is load-bearing (see spawn.hpp). Only async-signal-safe
         // calls past this point; no allocation, no iostreams.
-        if (cwd && ::chdir(cwd) != 0) _exit(kExitChdirFailed);
+        ::close(status_pipe[0]);
+        const int sfd = status_pipe[1];
+
+        // Report which step failed, then exit. write(2) is async-signal-safe;
+        // the result is deliberately ignored (nothing useful to do if the
+        // parent is gone, and the exit code still carries a coarse signal).
+        const auto fail = [sfd](ChildStage st, int code) {
+            const unsigned char b = static_cast<unsigned char>(st);
+            ssize_t n;
+            do { n = ::write(sfd, &b, 1); } while (n < 0 && errno == EINTR);
+            _exit(code);
+        };
+
+        if (cwd && ::chdir(cwd) != 0) fail(ChildStage::Chdir, kExitChdirFailed);
 
         // Own process group, so the ENTIRE subtree (children, grandchildren,
         // anything exec'd) shares one pgid. T0 observation filters audit
@@ -309,13 +388,13 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // parent carries its own access rights past the sandbox boundary
         // (measured -- see close_inherited_fds), so leaving one open would
         // hand the child a hole straight through the path policy.
-        close_inherited_fds();
+        close_inherited_fds(sfd);
 
 #if defined(__APPLE__)
         // Confinement lands here: after fork (so bastion stays unconfined),
         // before exec (so the child can never run unconfined).
         if (sandbox_init(compiled.profile.c_str(), 0, nullptr) != 0) {
-            _exit(kExitSandboxFailed);
+            fail(ChildStage::Sandbox, kExitSandboxFailed);
         }
 #elif defined(__linux__)
         // Same ordering, same fail-closed contract. linux_ll::apply() also sets
@@ -327,19 +406,37 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // context here; if the host ever spawns from a thread while another
         // holds the malloc lock, this must be pre-compiled before fork().
         if (!linux_ll::apply(policy, proxy_port).empty()) {
-            _exit(kExitSandboxFailed);
+            fail(ChildStage::Sandbox, kExitSandboxFailed);
         }
 #endif
         ::execve(cargv[0], cargv.data(), cenv.data());
-        _exit(kExitExecFailed);
+        fail(ChildStage::Exec, kExitExecFailed);
+        _exit(kExitExecFailed);  // unreachable; keeps the compiler happy
     }
 
     // ---- parent ------------------------------------------------------------
+    // The write end must not stay open here, or the read below would never see
+    // EOF on the success path.
+    ::close(status_pipe[1]);
+
     out.pid = static_cast<int>(pid);
     out.pgid = static_cast<int>(pid);  // setpgid(0,0) in the child => pgid == pid
     // Also set it from the parent to close the race where the child has not yet
     // run setpgid but the observer is already reading audit lines.
     ::setpgid(pid, pid);
+
+    // Returns as soon as the child either reports a setup failure (one byte) or
+    // reaches execve (EOF, because the pipe is O_CLOEXEC). This does not wait
+    // on the workload -- only on bastion's own setup finishing.
+    {
+        unsigned char b = 0;
+        ssize_t n;
+        do {
+            n = ::read(status_pipe[0], &b, 1);
+        } while (n < 0 && errno == EINTR);
+        out.setup_stage = (n == 1) ? b : 0;
+    }
+    ::close(status_pipe[0]);
 
     if (!req.wait) return out;  // caller will spawn_wait() later
 
@@ -387,15 +484,20 @@ void spawn_wait(SpawnResult& out) {
     }
 
     out.exit_code = WEXITSTATUS(status);
-    switch (out.exit_code) {
-        case kExitSandboxFailed:
+
+    // Attribution comes from the status pipe, NOT from the exit code. A shell
+    // exits 126/127 on its own when a confined exec is denied, so keying off
+    // the code alone reported a correctly-blocked attack as a bastion failure.
+    // setup_stage is nonzero only if bastion's own setup actually failed.
+    switch (static_cast<ChildStage>(out.setup_stage)) {
+        case ChildStage::Sandbox:
             out.error = "child failed to apply the sandbox policy; it was NOT "
                         "executed (fail-closed)";
             break;
-        case kExitChdirFailed:
+        case ChildStage::Chdir:
             out.error = "child could not chdir to the requested directory";
             break;
-        case kExitExecFailed:
+        case ChildStage::Exec:
             out.error = "exec failed (binary missing or not executable)";
             break;
         default:

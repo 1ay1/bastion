@@ -13,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace bastion {
 

@@ -55,6 +55,16 @@ struct AbiInfo {
 // Query the running kernel. Never inferred from build-time headers.
 [[nodiscard]] AbiInfo probe_abi();
 
+// The per-run private temp dir granted by the ergonomic floor when the user has
+// no $TMPDIR of their own, or "" if one could not be created.
+//
+// Created 0700 and named per-PID. Linux (unlike macOS) usually leaves $TMPDIR
+// unset, and granting shared world-readable /tmp instead would leak data
+// between agents on the same box -- MEASURED as 6 escapes in the adversarial
+// suite. spawn() exports this as the child's TMPDIR/TMP/TEMP, so compile() and
+// the child agree on which directory the toolchain should use.
+[[nodiscard]] const std::string& private_tmp_dir();
+
 struct Ruleset {
     std::uint64_t handled_fs = 0;    // clamped to the probed ABI
     std::uint64_t handled_net = 0;

@@ -1,12 +1,64 @@
 # Linux bring-up
 
-Everything you need to get bastion enforcing on Linux, written by someone who
-could not run Linux. **The Landlock backend has never executed on a real
-kernel.** It is complete, it typechecks against the real UAPI, and its call
-sites are verified wired — but every runtime claim below is *expected*, not
-*measured*. Where macOS numbers exist they are labelled as such.
+Everything you need to get bastion enforcing on Linux.
 
-Your job is to turn the expectations into measurements. §6 is the checklist.
+**STATUS: the Landlock backend now runs, enforces, and passes its full suite on
+a real kernel.** First bring-up measured on **kernel 7.2.2-zen1 (Landlock ABI
+v10), GCC 16.2.1**: 13/13 tests green, adversarial suite 30 attempts / 0
+escapes, T3 per-host egress verified end to end against a live host.
+
+Five real bugs were found the moment it touched hardware; all are fixed, and
+each is recorded as a MEASURED comment at the site so it cannot silently
+regress:
+
+| # | Bug | Symptom | Fix |
+|---|---|---|---|
+| 1 | `std::exchange` used without `<utility>` | build failed on GCC 16 | added the include (`src/proxy.cpp`) |
+| 2 | directory-only rights sent for regular files | `add_rule` EINVAL on `/etc/ld.so.cache` → **every confined spawn failed closed** | strip `kDirOnlyRights` per-inode in `apply()` |
+| 3 | `#if defined(LANDLOCK_RULE_NET_PORT)` — an *enumerator*, never a macro | whole net-rule loop compiled out: all egress denied **including the T3 broker**, so T3 was unusable while looking enforced | guard on `LANDLOCK_ACCESS_NET_CONNECT_TCP` (a real `#define`) |
+| 4 | setup failure inferred from exit code | a shell's own 126/127 ("permission denied") was reported as "bastion failed to apply the policy" — a correctly BLOCKED attack looked like an escape | CLOEXEC status pipe carries the real stage (`src/spawn.cpp`) |
+| 5 | ergonomic floor missing TLS/DNS/tmp | `curl` failed with "error adding trust anchors"; `cc` failed with "cannot create temporary file" | floor grants trust store, resolver config, and a **private per-run tmp dir** |
+
+Bug 3 is the one to remember: it is the failure mode a security tool is worst
+at noticing, because *more* was denied than intended. Nothing escaped, so no
+test that only asks "did anything get out?" would ever have caught it. It was
+found by asking the opposite question — does the thing that should be allowed
+actually work?
+
+On bug 5, note what was NOT done: the obvious fix is to grant `/tmp`, and that
+is wrong. `/tmp` is world-readable, so a blanket grant leaks data between
+agents on the same box — measured immediately as **6 new escapes** in the
+adversarial suite. Linux usually leaves `$TMPDIR` unset (macOS does not), so
+bastion mints a private 0700 per-run directory and points `TMPDIR`/`TMP`/`TEMP`
+at it, removing it at exit.
+
+§6 is the checklist. Numbers below labelled *expected* are still unverified on
+other kernels — especially older ABI levels, which this box cannot exercise.
+
+---
+
+## 0. Verified on this kernel
+
+```
+$ uname -r
+7.2.2-zen1-1-zen
+$ cat /sys/kernel/security/lsm
+capability,landlock,lockdown,yama,bpf
+$ bastion doctor
+backend:     landlock
+note:        Landlock ABI v10
+max tier:    T3:isolate
+path authority:   yes
+net filtering:    yes (by port)
+$ ctest
+100% tests passed out of 13
+```
+
+Still open on Linux: `bastion observe` has no backend (needs Landlock audit,
+ABI v7+/kernel 6.15, or an eBPF collector), so `synthesize` has no evidence
+source here — it correctly refuses to emit a policy rather than guessing. T4
+(namespaces/microVM) is unimplemented, and `probe()` reports
+`namespace isolation: no` accordingly.
 
 ---
 
@@ -193,13 +245,15 @@ Work top to bottom. Each item is a claim that is currently **unverified**.
 
 ### 6.1 Basics
 
-- [ ] `bastion doctor` reports `landlock` and the expected ABI version
-- [ ] `ctest` passes (`landlock_uapi` and the pure-logic suites should already)
-- [ ] Write inside the workspace succeeds
-- [ ] Read outside the workspace fails
-- [ ] `/etc/shadow`, `~/.ssh`, `~/.aws` all denied
-- [ ] A dynamically-linked binary (`/bin/ls`) runs at T2 — the loader-path check
-- [ ] A compiler (`cc hello.c`) works, including its temp files
+- [x] `bastion doctor` reports `landlock` and the expected ABI version (v10)
+- [x] `ctest` passes — 13/13 on 7.2.2
+- [x] Write inside the workspace succeeds
+- [x] Read outside the workspace fails
+- [x] `/etc/shadow`, `~/.ssh`, `~/.aws` all denied
+- [x] A dynamically-linked binary (`/bin/ls`) runs at T2 — the loader-path check
+- [x] A compiler (`cc hello.c`) works, including its temp files — needed the
+      private-tmp + `FS_TRUNCATE` fixes; `cc1` opens scratch `O_CREAT|O_TRUNC`,
+      so a write grant without TRUNCATE compiles nothing
 
 ### 6.2 Adversarial (`build/adversarial_test`)
 
@@ -207,13 +261,16 @@ Already enabled on Linux — the attacks are platform-independent, so this suite
 runs as-is. It is the acceptance test for the backend: if it is green, the
 filesystem boundary holds.
 
-- [ ] Symlink in workspace → outside target is denied
-- [ ] `../` traversal denied
-- [ ] Sibling-prefix (`/tmp/ws` must not authorize `/tmp/ws-evil`) denied
-- [ ] Copying `sh` into the workspace and exec'ing it does not shed policy
-- [ ] **Inherited fd**: the measured macOS escape. Landlock docs say rights
-      attach to the open file description, so this *should* behave identically —
-      confirm it, since `close_inherited_fds()` is the only thing stopping it.
+- [x] Symlink in workspace → outside target is denied
+- [x] `../` traversal denied
+- [x] Sibling-prefix (`/tmp/ws` must not authorize `/tmp/ws-evil`) denied
+- [x] Copying `sh` into the workspace and exec'ing it does not shed policy —
+      denied by W^X: a write grant carries no `FS_EXECUTE`, so the copy is
+      created but never executable. Grant `fs.exec` in a policy file to run
+      binaries you build.
+- [x] **Inherited fd**: CONFIRMED identical to macOS — rights attach to the
+      open file description, and `close_inherited_fds()` is indeed the only
+      thing stopping it (it now spares one fd: the CLOEXEC status pipe).
 
 Two assertions are macOS-gated and stay that way: the Seatbelt hostname warning
 (Landlock filters by port, so the T2 message differs) and SBPL injection
@@ -233,10 +290,10 @@ fool). The Linux build substitutes a portable equivalent.
 
 ### 6.4 T3 egress
 
-- [ ] Allowlisted host reachable through the broker
-- [ ] Non-allowlisted host refused with `403` on CONNECT
-- [ ] `curl --noproxy '*' https://1.1.1.1` **kernel-denied**
-- [ ] `nc -z 1.1.1.1 443` **kernel-denied** (raw socket, not just HTTP clients)
+- [x] Allowlisted host reachable through the broker (`example.com` → 200)
+- [x] Non-allowlisted host refused with `403` on CONNECT
+- [x] `curl --noproxy '*' https://1.1.1.1` **kernel-denied**
+- [x] `nc -z 1.1.1.1 443` **kernel-denied** (raw socket, not just HTTP clients)
 - [ ] ABI < v4: `--tier t3` refused with the ABI message, not silently degraded
 
 ### 6.5 Distro matrix

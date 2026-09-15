@@ -40,6 +40,13 @@ struct SpawnResult {
     int pid = -1;                          // child pid
     int pgid = -1;                         // child process GROUP (== pid)
 
+    // Which of BASTION'S OWN setup steps failed in the child, reported over a
+    // CLOEXEC status pipe: 0 = none (the workload really exec'd), 1 = chdir,
+    // 2 = sandbox apply, 3 = exec. Never inferred from the exit code, because
+    // a shell produces 126/127 itself when a confined exec is denied -- which
+    // made a correctly BLOCKED attack look like a bastion failure.
+    unsigned char setup_stage = 0;
+
     // T3 egress broker results. Populated when the policy is T3+ and carries
     // network rules; these feed the audit ledger and `bastion synthesize`.
     std::uint16_t proxy_port = 0;

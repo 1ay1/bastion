@@ -110,6 +110,19 @@ static_assert(sizeof(struct landlock_ruleset_attr) == 6 * sizeof(std::uint64_t),
 static_assert(sizeof(struct landlock_path_beneath_attr) == 12,
               "path_beneath_attr must be packed (8 + 4), not padded to 16");
 
+// REGRESSION GUARD (measured on kernel 7.2.2): LANDLOCK_RULE_NET_PORT is an
+// ENUMERATOR, not a macro, so `#if defined(LANDLOCK_RULE_NET_PORT)` is always
+// false and silently compiles out every net rule -- which left handled_net set
+// (all egress denied) with no allow-rule for the T3 broker, so T3 denied the
+// workload its own broker. Guard net code on LANDLOCK_ACCESS_NET_CONNECT_TCP,
+// which really is a #define.
+#if defined(LANDLOCK_RULE_NET_PORT)
+#  error "LANDLOCK_RULE_NET_PORT is now a macro; revisit the net-rule guards"
+#endif
+#if !defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+#  error "LANDLOCK_ACCESS_NET_CONNECT_TCP must be a macro; it is the net guard"
+#endif
+
 int main() {
     struct landlock_ruleset_attr attr{};
     attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE |
@@ -184,6 +197,18 @@ check_decl "T3 pins egress to the broker port" \
   "$ROOT/src/backend/landlock.cpp" 't3_broker'
 check_decl "T3 fails closed below ABI v4" \
   "$ROOT/src/backend/landlock.cpp" 'needs Landlock ABI v4\+'
+
+# The net-rule loop must NOT be guarded on LANDLOCK_RULE_NET_PORT: that is an
+# enumerator, so `#if defined(...)` is always false and deletes the loop, which
+# denies T3 its own broker port while still denying all other egress (a silent
+# availability failure that looks like enforcement).
+if grep -q '^# *if defined(LANDLOCK_RULE_NET_PORT)' "$ROOT/src/backend/landlock.cpp"; then
+  echo "FAIL: net rules guarded on LANDLOCK_RULE_NET_PORT (an enum, never defined)"
+  echo "      use LANDLOCK_ACCESS_NET_CONNECT_TCP, which is a real #define"
+  fail=1
+else
+  echo "OK: net rules are guarded on a real macro, not the enumerator"
+fi
 
 rm -rf "$FAKE"
 if [ "$fail" -ne 0 ]; then
