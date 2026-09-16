@@ -1,6 +1,6 @@
 # bastion
 
-Cross-platform sandboxing for AI agents, in modern type-theoretic C++23.
+Sandboxing for AI agents on Linux, in modern type-theoretic C++23.
 
 **The bypass is a capability, not a power switch.**
 
@@ -14,9 +14,15 @@ bastion run --policy bastion.toml -- ./legacy-build.sh
 
 | | |
 |---|---|
-| **macOS** | Working as of the last macOS run: T2 + T3, 13/13 tests, 29 adversarial escape attempts, 0 escapes. **Not re-measured since the Linux hardening work** — the shared code compiles clean for `__APPLE__` and the Seatbelt path is syntax-checked in CI, but the numbers above predate it. Re-run `ctest` on a Mac before relying on them. |
-| **Linux** | Working, and the most complete backend. T0–T3 **measured on kernel 7.2.2 (Landlock ABI v10)**: 30/30 tests, 30 adversarial escape attempts, **0 escapes and 0 documented limits**. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
-| **Windows** | Specified only (AppContainer + restricted token). |
+| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 30/30 tests, 30 adversarial escape attempts, **0 escapes and 0 documented limits**. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
+| **macOS** | Best-effort. A Seatbelt backend exists and the shared code is syntax-checked for `__APPLE__` in CI, but it has **not been run or measured** since the Linux hardening work. Treat it as unverified. |
+| **Windows** | Specified only (AppContainer + restricted token). Not implemented. |
+
+The project is **Linux-first by choice**. Landlock answers the path-set question
+directly — no mount namespace, no `pivot_root`, no setuid component — and it is
+the only backend where every claim in these docs has been measured on real
+hardware. The other platforms are kept compiling so the abstractions stay
+honest, not because they are ready.
 
 **Docs:** [CLI](docs/cli.md) · [Architecture](docs/architecture.md) ·
 [Security model](docs/security-model.md) · [Linux bring-up](docs/linux-bringup.md) ·

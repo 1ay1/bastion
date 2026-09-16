@@ -6,21 +6,7 @@ on:
   pull_request:
 
 jobs:
-  macos:
-    name: macOS (Seatbelt, T2+T3)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-      - name: Build
-        run: cmake --build build -j
-      - name: Doctor
-        run: ./build/bastion doctor
-      - name: Test
-        # The egress suite needs outbound network; GitHub runners have it.
-        run: ctest --test-dir build --output-on-failure
-
+  # Linux is the SUPPORTED platform, so it runs first and it blocks.
   linux:
     name: Linux (Landlock + seccomp + namespaces)
     runs-on: ubuntu-24.04
@@ -90,3 +76,26 @@ jobs:
         # branches are invisible to a macOS compile, so a signature mismatch
         # would otherwise surface only when someone builds on Linux.
         run: sh tools/check_landlock.sh
+
+  macos:
+    name: macOS (Seatbelt) — advisory
+    runs-on: macos-14
+    # ADVISORY, and honestly so. bastion is Linux-first: Landlock is where
+    # every claim in the docs has been measured. The Seatbelt backend still
+    # builds and its tests still run here, which keeps the abstractions honest
+    # -- a change that only works because of a Linux-ism shows up immediately.
+    #
+    # But it does not BLOCK, because nobody is currently verifying macOS
+    # behaviour on real hardware, and a gate nobody can diagnose is a gate that
+    # gets bypassed. Flip this to blocking when someone owns the platform.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build -j
+      - name: Doctor
+        run: ./build/bastion doctor
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
