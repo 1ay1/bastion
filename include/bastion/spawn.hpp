@@ -4,6 +4,10 @@
 #pragma once
 
 #include "bastion/policy.hpp"
+// Pulled in so a caller using `wait = false` can hold a SignalForwarder over
+// the detached window without hunting for a second header -- the advice on
+// SpawnRequest::wait would otherwise not compile as written.
+#include "bastion/signal_forward.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -88,6 +92,15 @@ struct SpawnRequest {
     // waiting for it. Required by T0 observation: audit records must be drained
     // and attributed WHILE the subtree is alive, because getpgid() cannot
     // resolve a process that has already exited.
+    //
+    // THE CALLER THEN OWNS SIGNAL FORWARDING. spawn() arms a SignalForwarder
+    // so that killing bastion takes the child's whole process group with it,
+    // but that forwarder is scoped to the call -- returning early tears it
+    // down, leaving the detached child unprotected until the caller waits.
+    // A caller using this MUST hold its own bastion::SignalForwarder over the
+    // window, or an agent harness killing bastion mid-run orphans the subtree
+    // (see signal_forward.hpp for why that is a confinement problem, not just
+    // untidiness).
     bool wait = true;
 };
 
@@ -142,6 +155,11 @@ struct SpawnResult {
 
 // Wait for a child previously started with `wait = false`, filling in the exit
 // status fields of `result`.
+//
+// Does NOT forward signals: spawn()'s forwarder was torn down when it returned
+// early, so between that return and this call the child subtree is unprotected.
+// Hold a bastion::SignalForwarder{result.pgid} across that window (see
+// SpawnRequest::wait), or a harness killing bastion orphans the subtree.
 void spawn_wait(SpawnResult& result);
 
 // Build a sanitized environment that satisfies the ergonomic floor (DESIGN.md

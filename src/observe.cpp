@@ -1,5 +1,7 @@
 #include "bastion/observe.hpp"
 
+#include "bastion/signal_forward.hpp"
+
 #if defined(__linux__)
 #  include "bastion/backend/seccomp_notify.hpp"
 #endif
@@ -210,6 +212,16 @@ ObserveResult observe(const SpawnRequest& req) {
         res.error = child.error;
         return res;
     }
+
+    // spawn() armed a forwarder for the duration of ITS call, but wait=false
+    // returned early and tore it down -- so from here until the drain loop
+    // finishes, killing bastion would orphan the whole observed subtree. Take
+    // over that duty for the detached window.
+    //
+    // This matters more here than anywhere else: an observed workload runs
+    // UNCONFINED by design (that is what T0 is), so an orphan from `observe`
+    // holds the user's full authority rather than a policy's.
+    const SignalForwarder forwarder{static_cast<pid_t>(child.pgid)};
 
     int flags = ::fcntl(read_fd, F_GETFL, 0);
     ::fcntl(read_fd, F_SETFL, flags | O_NONBLOCK);
