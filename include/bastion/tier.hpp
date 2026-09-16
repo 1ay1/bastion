@@ -52,8 +52,15 @@ constexpr std::string_view tier_guarantee(Tier t) noexcept {
             return "Best-effort, in-process. Stops accidents, not a motivated "
                    "adversary: native code can bypass it.";
         case Tier::Kernel:
+            // "No network isolation" was WRONG and actively misleading: on
+            // Linux the kernel denies ALL egress at T2 unless a port rule is
+            // granted. Measured -- curl exits 7 under a plain `bastion run`.
+            // Saying the opposite sent users hunting a network fault. What T2
+            // lacks is per-HOST filtering, which needs the T3 broker.
             return "Kernel-enforced path-set authority. Survives arbitrary "
-                   "native code in the target. No network isolation.";
+                   "native code in the target. Egress is all-or-nothing: "
+                   "denied unless granted, and not filterable by host (use "
+                   "T3 for that).";
         case Tier::Isolate:
             return "Kernel enforcement + namespace isolation (net/pid/ipc, "
                    "instanced /tmp). Unprivileged; no setuid component.";

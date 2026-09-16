@@ -127,6 +127,53 @@ int main() {
         }
     }
 
+    std::puts("\n== 6. no FALSE attribution on ambiguous exit codes ==");
+    {
+        // An earlier version treated curl's exit 7 ("couldn't connect") as
+        // proof the sandbox blocked the network. But `sh -c 'exit 7'` is
+        // indistinguishable, so a plain failing command was confidently told
+        // the network was the problem -- sending the agent somewhere there is
+        // no bug. Landlock gives no T2 denial signal, so the cause CANNOT be
+        // known; bastion must not claim it.
+        for (const char* code : {"4", "6", "7"}) {
+            const std::string err =
+                run_cli(base + "-- sh -c 'exit " + code + "'");
+            check(!has(err, "looks like the sandbox"),
+                  (std::string{"exit "} + code +
+                   " is not blamed on the sandbox").c_str());
+        }
+    }
+
+    std::puts("\n== 7. a directory in PATH is not mistaken for a command ==");
+    {
+        // access(X_OK) returns 0 for a DIRECTORY with the search bit set, and
+        // PATH directories really do contain subdirectories
+        // (/usr/bin/core_perl on this box). Resolving one would hand execve a
+        // directory, which fails as "binary missing or not executable" -- the
+        // exact confusing message PATH resolution exists to prevent. A shell
+        // requires a regular file; so must we.
+        std::error_code ec;
+        std::string dirname;
+        for (const char* d : {"/usr/bin", "/bin", "/usr/sbin"}) {
+            for (const auto& e : fs::directory_iterator(d, ec)) {
+                if (ec) break;
+                if (e.is_directory(ec) && !ec) {
+                    dirname = e.path().filename().string();
+                    break;
+                }
+            }
+            if (!dirname.empty()) break;
+        }
+        if (!dirname.empty()) {
+            const std::string err = run_cli(base + "-- " + dirname);
+            check(has(err, "exec failed"),
+                  ("a PATH subdirectory ('" + dirname +
+                   "') is not run as a command").c_str());
+        } else {
+            std::puts("  [skip] no subdirectory found in PATH to test");
+        }
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",

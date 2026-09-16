@@ -198,6 +198,17 @@ std::string resolve_argv0(const std::string& cmd) {
         std::string candidate{dir};
         candidate += '/';
         candidate += cmd;
+
+        // access(X_OK) is NOT sufficient: it returns 0 for a DIRECTORY with
+        // the search bit set, and PATH directories really do contain
+        // subdirectories (/usr/bin/core_perl, /usr/bin/db5.3 on this box). A
+        // bare `core_perl` would then resolve to a directory and execve would
+        // fail with EACCES -- reported as "binary missing or not executable",
+        // which is exactly the confusing message this function exists to
+        // prevent. Require a regular file, as a shell does.
+        struct ::stat st {};
+        if (::stat(candidate.c_str(), &st) != 0) continue;
+        if (!S_ISREG(st.st_mode)) continue;
         if (::access(candidate.c_str(), X_OK) == 0) return candidate;
     }
     // Not found: hand back the original so the error names what was asked for

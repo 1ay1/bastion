@@ -585,26 +585,26 @@ int cmd_run(const Args& a) {
     const bool exec_denied = result.exit_code == 126 || result.exit_code == 127;
 
     // T2 has no broker, so a denied connection produces no bastion-side record
-    // at all -- the agent just sees curl's "Could not connect". That is the
-    // WORST case for thrashing, because it reads like a network outage.
-    // MEASURED: `curl https://example.com` at T2 printed only
-    //   curl: (7) Failed to connect ... Could not connect to server
-    // with nothing naming the sandbox.
+    // at all -- the agent just sees curl's "Could not connect". That is bad for
+    // thrashing, because it reads like a network outage.
     //
-    // curl exits 7 (couldn't connect) / 6 (couldn't resolve); wget uses 4.
-    // Those are the codes a kernel-level egress denial produces, so at a tier
-    // that denies ALL egress they are strong evidence it was us. Restricted to
-    // policies with no network grant, so a T3 run that genuinely lost
-    // connectivity is not misattributed.
+    // But there is NO kernel signal to confirm it: Landlock does not report
+    // denials at T2. Exit codes alone are far too weak to assert a cause --
+    // MEASURED: `sh -c 'exit 7'` is indistinguishable from curl's "couldn't
+    // connect", and the first version of this confidently told a plain failing
+    // command that the network was blocked.
+    //
+    // So this does NOT claim the network was the problem. It adds one factual
+    // line about the policy, phrased conditionally, and only when the policy
+    // really does deny all egress. Being wrong here costs more than being
+    // silent: a false cause sends the agent somewhere there is no bug.
     bool has_net_rule = false;
     for (const auto& r : policy.rules()) {
         if (any(r.right & (Right::NetEgress | Right::NetBind))) has_net_rule = true;
     }
-    const bool net_denied_by_tier =
-        !has_net_rule && policy.tier() >= Tier::Kernel &&
-        (result.exit_code == 6 || result.exit_code == 7 || result.exit_code == 4);
+    const bool net_is_denied = !has_net_rule && policy.tier() >= Tier::Kernel;
 
-    const bool likely_ours = egress_blocked || exec_denied || net_denied_by_tier;
+    const bool likely_ours = egress_blocked || exec_denied;
 
     if (result.exit_code != 0 && likely_ours && !policy.is_unconfined() &&
         !a.json) {
@@ -642,15 +642,14 @@ int cmd_run(const Args& a) {
                 "         network: DENIED at %s — use `-t t3 --net HOST:PORT`\n",
                 std::string{tier_name(policy.tier())}.c_str());
         }
-        if (net_denied_by_tier) {
+        if (net_is_denied) {
+            // Stated as a FACT about the policy, not as a diagnosis of this
+            // failure -- we cannot know whether the network was involved.
             std::fprintf(stderr,
-                "         network: ALL egress is kernel-denied at %s and this "
-                "policy grants none.\n"
-                "                  That exit code is what a blocked connection "
-                "looks like.\n"
-                "                  Allow one host: bastion run -t t3 --net "
-                "HOST:PORT -- <cmd>\n",
-                std::string{tier_name(policy.tier())}.c_str());
+                "         network: this policy grants no egress, so all "
+                "outbound is kernel-denied.\n"
+                "                  If the command needed the network: "
+                "bastion run -t t3 --net HOST:PORT -- <cmd>\n");
         }
         std::fprintf(stderr,
             "         next:    bastion observe -- <cmd> && bastion synthesize\n");
