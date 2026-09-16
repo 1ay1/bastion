@@ -160,6 +160,18 @@ if(BASTION_BUILD_TESTS)
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
     endforeach()
 
+    # Diagnostics: does a FAILING run tell an agent enough to recover? Checks
+    # both directions -- guidance on a real denial, and SILENCE on a genuine
+    # test failure, because a false "maybe it was the sandbox" sends the agent
+    # chasing a policy bug that does not exist.
+    add_executable(diagnostics_test tests/diagnostics_test.cpp)
+    target_link_libraries(diagnostics_test PRIVATE bastion)
+    target_compile_definitions(diagnostics_test PRIVATE
+        BASTION_CLI="$<TARGET_FILE:bastion_cli>")
+    add_dependencies(diagnostics_test bastion_cli)
+    add_test(NAME diagnostics COMMAND diagnostics_test)
+    set_tests_properties(diagnostics PROPERTIES TIMEOUT 120)
+
     # ABI degradation across v1-v10, WITHOUT needing ten kernels: compile() is
     # a pure function of (policy, AbiInfo), so every version can be exercised
     # here. Development happens on v10 where every capability exists, so the

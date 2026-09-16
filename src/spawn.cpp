@@ -161,13 +161,57 @@ void close_inherited_fds(int keep = -1) {
     }
 }
 
+// The PATH the child will actually see. Declared here because argv[0] is
+// resolved against THIS, not against bastion's own PATH -- see resolve_argv0.
+constexpr std::string_view kSandboxPath =
+    "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin";
+
+// Resolve a bare command name to an absolute path, the way a shell would.
+//
+// WHY THIS IS NOT execvp(): the child must confine BEFORE exec, and by then it
+// cannot search $PATH -- a Landlock ruleset built around the workspace will not
+// grant read on every PATH entry, and the child may not allocate anyway. So the
+// lookup happens HERE, in the parent, before the policy is compiled.
+//
+// It searches the PATH the CHILD will get (kSandboxPath), not bastion's own.
+// Resolving against the parent's PATH would find binaries in directories like
+// ~/.local/bin that the sandbox cannot execute, turning a clear "not found"
+// into a confusing mid-run denial.
+//
+// MEASURED: without this, `bastion run -- cc main.c` failed with "exec failed
+// (binary missing or not executable)" while `bastion observe -- cc main.c`
+// worked, because the observe backend used execvp(). Two subcommands, two
+// behaviours, and the first thing an agent types is a bare command name.
+std::string resolve_argv0(const std::string& cmd) {
+    // Anything with a slash is already a path: absolute, or relative to cwd,
+    // exactly as execve() would treat it.
+    if (cmd.find('/') != std::string::npos) return cmd;
+
+    std::string_view rest = kSandboxPath;
+    while (!rest.empty()) {
+        const auto colon = rest.find(':');
+        const std::string_view dir = rest.substr(0, colon);
+        rest = colon == std::string_view::npos ? std::string_view{}
+                                               : rest.substr(colon + 1);
+        if (dir.empty()) continue;
+
+        std::string candidate{dir};
+        candidate += '/';
+        candidate += cmd;
+        if (::access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+    // Not found: hand back the original so the error names what was asked for
+    // rather than some half-built path.
+    return cmd;
+}
+
 }  // namespace
 
 std::vector<std::string> sanitized_env(const Sealed& policy) {
     std::vector<std::string> env;
 
     // A coherent PATH whose entries are readable under the base profile.
-    env.emplace_back("PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin");
+    env.emplace_back(std::string{"PATH="} + std::string{kSandboxPath});
     env.emplace_back(std::string{"HOME="} + getenv_or("HOME", "/tmp"));
     env.emplace_back(std::string{"USER="} + getenv_or("USER", "agent"));
     env.emplace_back(std::string{"SHELL="} + getenv_or("SHELL", "/bin/sh"));
@@ -353,9 +397,17 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     }
 #endif
 
+    // Resolve a bare command name against the SANDBOX's PATH before forking.
+    // The child cannot search PATH itself: it is confined before exec, and may
+    // not allocate. Held in a named string so the c_str() below stays valid.
+    const std::string argv0 = resolve_argv0(req.argv[0]);
+
     std::vector<char*> cargv;
     cargv.reserve(req.argv.size() + 1);
-    for (const auto& a : req.argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(const_cast<char*>(argv0.c_str()));
+    for (std::size_t i = 1; i < req.argv.size(); ++i) {
+        cargv.push_back(const_cast<char*>(req.argv[i].c_str()));
+    }
     cargv.push_back(nullptr);
 
     std::vector<char*> cenv;

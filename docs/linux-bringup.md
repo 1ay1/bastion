@@ -4,7 +4,7 @@ Everything you need to get bastion enforcing on Linux.
 
 **STATUS: the Landlock backend now runs, enforces, and passes its full suite on
 a real kernel.** First bring-up measured on **kernel 7.2.2-zen1 (Landlock ABI
-v10), GCC 16.2.1**: 28/28 tests green, adversarial suite 30 attempts / 0
+v10), GCC 16.2.1**: 29/29 tests green, adversarial suite 30 attempts / 0
 escapes, T3 per-host egress verified end to end against a live host.
 
 Five real bugs were found the moment it touched hardware; all are fixed, and
@@ -51,7 +51,7 @@ max tier:    T3:isolate
 path authority:   yes
 net filtering:    yes (by port)
 $ ctest
-100% tests passed out of 28
+100% tests passed out of 29
 ```
 
 Still open on Linux: T4 (microVM) is unimplemented, and the distro/ABI matrix
@@ -301,7 +301,7 @@ Work top to bottom. Each item is a claim that is currently **unverified**.
 ### 6.1 Basics
 
 - [x] `bastion doctor` reports `landlock` and the expected ABI version (v10)
-- [x] `ctest` passes — 28/28 on 7.2.2
+- [x] `ctest` passes — 29/29 on 7.2.2
 - [x] Write inside the workspace succeeds
 - [x] Read outside the workspace fails
 - [x] `/etc/shadow`, `~/.ssh`, `~/.aws` all denied

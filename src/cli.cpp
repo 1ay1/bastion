@@ -509,6 +509,38 @@ int cmd_run(const Args& a) {
     }
     if (!result.launched()) {
         std::fprintf(stderr, "bastion: %s\n", result.error.c_str());
+
+        // The workload never started, so the advisory further down is never
+        // reached -- but this is the MOST likely W^X case, not the least:
+        // `bastion run -- ./my-binary` execs the binary directly, so a denied
+        // exec surfaces here rather than as a shell's 126. MEASURED: an agent
+        // that had just built ./t got only "exec failed (binary missing or not
+        // executable)", which reads as a build problem.
+        if (result.setup_stage == 3 /* ChildStage::Exec */ &&
+            !policy.is_unconfined() && !a.json) {
+            std::error_code ec;
+            const bool exists = fs::exists(a.argv.front(), ec);
+            if (exists) {
+                // lexically_normal(): without it a relative `./t` yields
+                // "/tmp/ws/." as the parent, which is valid but looks broken
+                // in a snippet the agent is meant to paste.
+                const auto dir = fs::absolute(a.argv.front(), ec)
+                                     .lexically_normal()
+                                     .parent_path();
+                std::fprintf(stderr,
+                    "         the file EXISTS, so this is the policy: a write "
+                    "grant does not include execute.\n"
+                    "         To run a binary you built, add an `fs.exec` rule "
+                    "for its directory:\n"
+                    "\n"
+                    "           [[allow]]\n"
+                    "           op   = \"fs.exec\"\n"
+                    "           path = \"%s\"\n"
+                    "\n"
+                    "         then: bastion run --policy <file> -- %s\n",
+                    dir.c_str(), a.argv.front().c_str());
+            }
+        }
         return 2;
     }
 
@@ -529,6 +561,101 @@ int cmd_run(const Args& a) {
             std::fprintf(stderr, "bastion: [warning] ledger: %s\n", err.c_str());
         }
     }
+
+    // THE MOMENT THAT DECIDES WHETHER AN AGENT RECOVERS OR THRASHES.
+    //
+    // A confined command that fails prints whatever the tool printed --
+    // "Permission denied", "Could not connect" -- with nothing tying it to
+    // bastion. An agent then "fixes" its code, retries, fails identically, and
+    // burns turns on a problem that is not in its code at all. That is exactly
+    // the thrashing DESIGN.md §4 says gets sandboxes switched off.
+    //
+    // But the inverse is just as bad. Printing this on EVERY nonzero exit
+    // means a genuine `test` failure gets told "maybe it was the sandbox" --
+    // which sends the agent chasing a policy problem that does not exist.
+    // MEASURED while dogfooding: `sh -c 'exit 1'` produced the full advisory
+    // block, pointing at nothing.
+    //
+    // So speak only with EVIDENCE that the boundary was actually involved:
+    //   - the broker refused a host, or
+    //   - the shell reported "cannot execute" / "not found" (126/127), which
+    //     under confinement usually means an exec the policy denied.
+    // Otherwise the failure is the workload's own and bastion stays quiet.
+    const bool egress_blocked = result.egress_denied > 0;
+    const bool exec_denied = result.exit_code == 126 || result.exit_code == 127;
+
+    // T2 has no broker, so a denied connection produces no bastion-side record
+    // at all -- the agent just sees curl's "Could not connect". That is the
+    // WORST case for thrashing, because it reads like a network outage.
+    // MEASURED: `curl https://example.com` at T2 printed only
+    //   curl: (7) Failed to connect ... Could not connect to server
+    // with nothing naming the sandbox.
+    //
+    // curl exits 7 (couldn't connect) / 6 (couldn't resolve); wget uses 4.
+    // Those are the codes a kernel-level egress denial produces, so at a tier
+    // that denies ALL egress they are strong evidence it was us. Restricted to
+    // policies with no network grant, so a T3 run that genuinely lost
+    // connectivity is not misattributed.
+    bool has_net_rule = false;
+    for (const auto& r : policy.rules()) {
+        if (any(r.right & (Right::NetEgress | Right::NetBind))) has_net_rule = true;
+    }
+    const bool net_denied_by_tier =
+        !has_net_rule && policy.tier() >= Tier::Kernel &&
+        (result.exit_code == 6 || result.exit_code == 7 || result.exit_code == 4);
+
+    const bool likely_ours = egress_blocked || exec_denied || net_denied_by_tier;
+
+    if (result.exit_code != 0 && likely_ours && !policy.is_unconfined() &&
+        !a.json) {
+        std::fprintf(stderr,
+            "\nbastion: this failure looks like the sandbox, not your code "
+            "(confined at %s).\n",
+            std::string{tier_name(policy.tier())}.c_str());
+
+        // Name what is actually granted, so the agent can tell at a glance
+        // whether the path it wanted is inside the boundary.
+        std::fprintf(stderr, "         granted:");
+        int shown = 0;
+        for (const auto& r : policy.rules()) {
+            if (any(r.right & (Right::FsRead | Right::FsWrite))) {
+                if (shown++ < 4) std::fprintf(stderr, " %s", r.scope.c_str());
+            }
+        }
+        if (shown == 0) std::fprintf(stderr, " (nothing)");
+        else if (shown > 4) std::fprintf(stderr, " (+%d more)", shown - 4);
+        std::fprintf(stderr, "\n");
+
+        if (exec_denied) {
+            // W^X is deliberate and surprising: a workspace grant carries no
+            // execute right, so a freshly built binary will not run. Say so
+            // outright -- this is the single most confusing denial in normal
+            // build-and-test use.
+            std::fprintf(stderr,
+                "         note:    a write grant does NOT include execute. To run "
+                "a binary you just built,\n"
+                "                  add an `fs.exec` rule for its directory in a "
+                "policy file.\n");
+        }
+        if (egress_blocked && policy.tier() < Tier::Isolate) {
+            std::fprintf(stderr,
+                "         network: DENIED at %s — use `-t t3 --net HOST:PORT`\n",
+                std::string{tier_name(policy.tier())}.c_str());
+        }
+        if (net_denied_by_tier) {
+            std::fprintf(stderr,
+                "         network: ALL egress is kernel-denied at %s and this "
+                "policy grants none.\n"
+                "                  That exit code is what a blocked connection "
+                "looks like.\n"
+                "                  Allow one host: bastion run -t t3 --net "
+                "HOST:PORT -- <cmd>\n",
+                std::string{tier_name(policy.tier())}.c_str());
+        }
+        std::fprintf(stderr,
+            "         next:    bastion observe -- <cmd> && bastion synthesize\n");
+    }
+
     return result.exit_code;
 }
 

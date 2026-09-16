@@ -24,6 +24,37 @@ bastion synthesize [--ledger PATH]            turn a session log into a policy
 | `--no-ledger` | do not write an audit log. |
 | `--json` | machine-readable output. |
 
+### When something fails
+
+bastion tells you when a failure is probably **its** fault, and stays quiet when
+it is not. That second half matters as much as the first: an agent told "maybe
+it was the sandbox" after a genuine test failure will chase a policy bug that
+does not exist.
+
+The advisory appears only with evidence the boundary was involved — the broker
+refused a host, an exec was denied, or a connection failed at a tier that
+denies all egress:
+
+```sh
+$ bastion run -- ./my-binary
+bastion: exec failed (binary missing or not executable)
+         the file EXISTS, so this is the policy: a write grant does not include execute.
+         To run a binary you built, add an `fs.exec` rule for its directory:
+
+           [[allow]]
+           op   = "fs.exec"
+           path = "/tmp/project"
+
+         then: bastion run --policy <file> -- ./my-binary
+```
+
+A plain `exit 1` from your test suite produces no such block.
+
+Commands are resolved against the **sandbox's** `PATH`, not yours, so
+`bastion run -- cc main.c` works without an absolute path — and a binary that
+only exists in a directory the sandbox cannot execute fails as "not found"
+rather than as a confusing mid-run denial.
+
 ### Resource ceilings
 
 Opt-in, and off by default: a ceiling that fires during a legitimate build is
