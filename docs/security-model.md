@@ -196,11 +196,46 @@ flips and the docs get corrected.
 | Host processes visible (`ps aux`) | T2 | Use `--tier t3` on Linux (PID namespace). Still open on macOS, which has no unprivileged equivalent. |
 | No disk-space quota | all | `--max-file-mb` caps single files, not total bytes written |
 | `--max-procs`/`--max-mem-mb` need a delegated cgroup | Linux | With one, they are a true per-sandbox budget; without, bastion falls back to RLIMIT_NPROC (per-uid, thread-counted) and reports the downgrade |
-| No mount namespace isolation of the filesystem | all | T3 gets a private mount ns for `/proc`, but does not pivot_root |
+| Path EXISTENCE is probeable | all | Landlock denies reading and listing, but `stat(2)` on a denied path still distinguishes "exists" from "does not". MEASURED: a T3 workload cannot list `/`, read `/etc/shadow` or enumerate `/home`, but `test -e /home/alice` succeeds. Closing it needs `pivot_root`; see below. |
 | Kernel exploits | all | Out of scope; T4 |
 | Landlock ABI < v2 denies cross-dir rename | T2 Linux | Kernel 5.19+ |
 | Landlock ABI < v4 cannot mediate network | T3 Linux | T3 **refused**, not degraded |
 | Unprivileged user namespaces disabled | T3 Linux | Process isolation is dropped and **reported**; the file/network boundary is unaffected |
+
+---
+
+### On `pivot_root`
+
+T3 creates user, PID, IPC and mount namespaces, but does **not** `pivot_root`
+into a minimal tree. That is deliberate, and it is worth showing the working
+because the obvious reading — "the workload can see the whole filesystem" — is
+wrong.
+
+Measured on kernel 7.2.2, inside `bastion run -t t3`:
+
+| Probe | Result |
+|---|---|
+| `ls /` | **denied** |
+| `cat /etc/shadow` | **denied** |
+| `ls /home` | **denied** |
+| `test -e /home/alice` | **succeeds** |
+
+Landlock already denies reading and listing everything outside the policy. What
+survives is *existence*: `stat(2)` on a denied path still distinguishes "exists"
+from "does not", because path traversal metadata has to be granted for any
+nested rule to resolve at all (`fs.stat` is unconditionally floor-granted for
+that reason).
+
+`pivot_root` would close it — verified working unprivileged inside T3's existing
+namespaces, hiding the host tree completely. The cost is that every path the
+workload needs must then be bind-mounted in: `/usr`, `/lib`, the loader cache,
+the workspace, `$TMPDIR`, the toolchain caches. That is the mount-topology
+problem this project exists to avoid (DESIGN.md §2–3), reintroduced to close a
+leak that reveals *whether a path exists* and nothing about its contents.
+
+So the trade is stated rather than taken: **a narrow, named leak instead of a
+broad, fragile mechanism.** If existence-probing is inside your threat model,
+T4 is the honest answer, not a bind-mount farm.
 
 ---
 

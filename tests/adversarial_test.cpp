@@ -337,6 +337,48 @@ int main() {
         fs::remove(planted, ec);
     }
 
+    // THE FILESYSTEM VIEW AT T3, asserted precisely.
+    //
+    // The limits table says path EXISTENCE is probeable while contents are
+    // not, and that claim has to be pinned in both directions -- a documented
+    // limit that is not tested is a claim that drifts.
+    //
+    // MEASURED on kernel 7.2.2: Landlock denies listing / and /home and
+    // reading /etc/shadow, but `test -e` on a denied path still succeeds,
+    // because traversal metadata must be granted for nested rules to resolve
+    // (fs.stat is unconditionally floor-granted). pivot_root would close it at
+    // the cost of a bind-mount farm -- see security-model.md "On pivot_root".
+    {
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "ls / >/dev/null 2>&1"};
+        must_deny("T3: list the root directory", spawn(t3, r));
+    }
+    {
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "ls /home >/dev/null 2>&1"};
+        must_deny("T3: enumerate /home", spawn(t3, r));
+    }
+    {
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "cat /etc/shadow >/dev/null 2>&1"};
+        must_deny("T3: read /etc/shadow", spawn(t3, r));
+    }
+    {
+        // The OTHER direction: this is the documented residual leak. It is
+        // expected to succeed, and the suite records it as a known limit so a
+        // future change that closes it shows up as a deliberate improvement
+        // rather than an unexplained behaviour change.
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "test -e /etc/shadow"};
+        auto probe = spawn(t3, r);
+        known_limit("path existence is probeable",
+                    probe.launched() && probe.exit_code == 0,
+                    "stat(2) distinguishes exists/absent on a denied path; "
+                    "traversal metadata must be granted for nested rules to "
+                    "resolve. Closing it needs pivot_root -- see "
+                    "security-model.md.");
+    }
+
     std::printf("\n%s: %d escape(s), %d documented limit(s)\n",
                 failures == 0 ? "NO ESCAPES" : "SANDBOX ESCAPED",
                 failures, known_limits);
