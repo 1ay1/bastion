@@ -5,12 +5,14 @@
 
 #include <spawn.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -1007,8 +1009,36 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // copy of the write end closes, which execve/_exit guarantees.
     if (cap_r.get() >= 0) {
         cap_w.reset();   // parent's copy must go, or EOF never comes
+
+        // A DEADLINE, not a blocking read. read() on a pipe whose write end is
+        // held by a hung child never returns, so without poll() a timeout is
+        // unrepresentable once bastion owns the descriptor -- the host cannot
+        // race us for it. poll() lets the same loop serve both: wait for bytes,
+        // but never past the deadline.
+        using clock = std::chrono::steady_clock;
+        const bool bounded = req.timeout_seconds > 0;
+        const auto deadline =
+            clock::now() + std::chrono::seconds{req.timeout_seconds};
+
         char buf[16 * 1024];
         for (;;) {
+            if (bounded) {
+                const auto left = deadline - clock::now();
+                if (left <= std::chrono::steady_clock::duration::zero()) {
+                    out.timed_out = true;
+                    break;
+                }
+                const auto ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(left)
+                        .count();
+                struct pollfd pfd{cap_r.get(), POLLIN, 0};
+                const int pr = ::poll(&pfd, 1, static_cast<int>(ms));
+                if (pr == 0) { out.timed_out = true; break; }
+                if (pr < 0) {
+                    if (errno == EINTR) continue;
+                    break;                     // real error; keep what we have
+                }
+            }
             const ssize_t n = ::read(cap_r.get(), buf, sizeof buf);
             if (n > 0) {
                 const std::size_t take = static_cast<std::size_t>(n);
@@ -1032,6 +1062,37 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
             break;                             // real error; keep what we have
         }
         cap_r.reset();
+    }
+
+    // Timed out: kill the process GROUP, not the pid. A workload that forked
+    // leaves children holding every path the policy granted, and killing only
+    // the leader leaves them running with nothing supervising them. TERM first
+    // so a well-behaved child can flush, then KILL for one that ignores it --
+    // without the escalation a process that traps SIGTERM makes the deadline
+    // advisory, which is the bug this exists to fix.
+    if (out.timed_out && out.pgid > 0) {
+        ::kill(-static_cast<pid_t>(out.pgid), SIGTERM);
+        bool reaped = false;
+        for (int i = 0; i < 100; ++i) {       // ~500 ms grace
+            int st = 0;
+            const pid_t w = ::waitpid(static_cast<pid_t>(out.pid), &st, WNOHANG);
+            if (w == static_cast<pid_t>(out.pid)) { reaped = true; break; }
+            if (w < 0 && errno != EINTR) break;
+            ::usleep(5000);
+        }
+        if (!reaped) {
+            ::kill(-static_cast<pid_t>(out.pgid), SIGKILL);
+            int st = 0;
+            while (::waitpid(static_cast<pid_t>(out.pid), &st, 0) < 0
+                   && errno == EINTR) {}
+        }
+        out.pid = -1;                         // already reaped; skip spawn_wait
+        out.signalled = true;
+        out.signal_number = SIGKILL;
+        out.exit_code = 128 + SIGKILL;
+        out.warnings.push_back(
+            "timed out after " + std::to_string(req.timeout_seconds) +
+            "s; the process group was killed");
     }
 
     spawn_wait(out);

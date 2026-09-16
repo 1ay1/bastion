@@ -127,6 +127,23 @@ struct SpawnRequest {
     // so a caller can say "truncated" rather than silently presenting a
     // prefix as the whole answer.
     std::size_t max_output_bytes = 0;
+
+    // Wall-clock deadline for the whole run. 0 = wait forever.
+    //
+    // This belongs HERE rather than in the caller, and the reason is specific
+    // to capture_output: once bastion owns the pipe, the caller cannot
+    // implement its own timeout without racing us for the descriptor. An
+    // external supervisor can only kill the process it launched -- which is
+    // the host itself -- so a host embedding bastion in-process had no way to
+    // bound a hung child at all. Before this existed, `capture_output` turned
+    // every timeout into a permanent hang: the drain loop below blocks in
+    // read() until EOF, and a child that never exits never sends one.
+    //
+    // Enforcement kills the child's process GROUP, not just the child, so a
+    // workload that forked is not left behind holding the policy's grants
+    // (see signal_forward.hpp). SIGTERM first, then SIGKILL after a short
+    // grace period, so a well-behaved child still gets to flush and clean up.
+    unsigned timeout_seconds = 0;
 };
 
 struct EgressAttempt;  // proxy.hpp
@@ -148,6 +165,12 @@ struct SpawnResult {
     // True when max_output_bytes stopped the read before EOF. A caller must
     // say so rather than presenting a prefix as the whole answer.
     bool output_truncated = false;
+
+    // True when SpawnRequest::timeout_seconds expired and bastion killed the
+    // process group. Distinct from a plain signal death: the workload did not
+    // choose to die and its output is a PREFIX, so a caller must report "timed
+    // out" rather than presenting a partial transcript as a completed run.
+    bool timed_out = false;
 
     // Which of BASTION'S OWN setup steps failed in the child, reported over a
     // CLOEXEC status pipe: 0 = none (the workload really exec'd), 1 = chdir,

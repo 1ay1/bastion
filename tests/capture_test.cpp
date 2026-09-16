@@ -18,6 +18,9 @@
 #include <cstdio>
 #include <string>
 
+#include <chrono>
+#include <unistd.h>
+
 using namespace bastion;
 
 static int failures = 0;
@@ -103,6 +106,85 @@ int main() {
         check(res.launched(), "launched");
         check(res.exit_code != 0, "the denied read failed");
         check(!res.output.empty(), "the diagnostic reached the caller");
+    }
+
+    std::puts("\n== 6. the deadline bounds a hung child ==");
+    {
+        // The regression this closes: with capture_output the parent blocks in
+        // read() until EOF, and a child that never exits never sends one. A
+        // host cannot bound that itself -- bastion owns the descriptor -- so
+        // before timeout_seconds existed, one hung tool hung the agent forever.
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "sleep 30"};
+        r.capture_output   = true;
+        r.timeout_seconds  = 1;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto res = spawn(sealed, r);
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+
+        check(res.launched(), "launched");
+        check(res.timed_out, "timed_out is REPORTED, not inferred from a code");
+        check(secs < 10, "returned at the deadline, not at the child's leisure");
+    }
+
+    std::puts("\n== 7. output written BEFORE the deadline survives ==");
+    {
+        // A timeout must not discard what the workload already said. The
+        // partial transcript is usually the only evidence of where it hung,
+        // so losing it turns a diagnosable hang into a bare "timed out".
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "echo progress-so-far; sleep 30"};
+        r.capture_output  = true;
+        r.timeout_seconds = 1;
+        auto res = spawn(sealed, r);
+        check(res.timed_out, "timed out");
+        check(res.output.find("progress-so-far") != std::string::npos,
+              "pre-deadline output is kept");
+    }
+
+    std::puts("\n== 8. the deadline kills the GROUP, not just the leader ==");
+    {
+        // A workload that forked leaves children holding every path the policy
+        // granted. Killing only the leader leaves them running unsupervised,
+        // which is the orphan bug signal_forward.hpp exists to prevent -- the
+        // deadline path has to honour it too.
+        const char* marker = "/tmp/bastion-deadline-orphan.probe";
+        ::unlink(marker);
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c",
+                  "sh -c 'sleep 3; echo leaked > /tmp/bastion-deadline-orphan.probe' &"
+                  " sleep 30"};
+        r.capture_output  = true;
+        r.timeout_seconds = 1;
+        auto res = spawn(sealed, r);
+        check(res.timed_out, "timed out");
+        ::sleep(5);          // past when the grandchild would have written
+        check(::access(marker, F_OK) != 0,
+              "the forked grandchild was killed too, not orphaned");
+        ::unlink(marker);
+    }
+
+    std::puts("\n== 9. a child that finishes early is NOT marked timed out ==");
+    {
+        // The deadline must be a ceiling, not a schedule: a fast command with
+        // a generous timeout has to return immediately and cleanly. Getting
+        // this wrong would make every bounded run look like a failure.
+        SpawnRequest r;
+        r.argv = {"/bin/sh", "-c", "echo quick"};
+        r.capture_output  = true;
+        r.timeout_seconds = 30;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto res = spawn(sealed, r);
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+
+        check(!res.timed_out, "not marked timed out");
+        check(res.exit_code == 0, "clean exit preserved");
+        check(res.output.find("quick") != std::string::npos, "output captured");
+        check(secs < 5, "returned when the CHILD did, not at the deadline");
     }
 
     std::printf("\n%s (%d failure%s)\n",
