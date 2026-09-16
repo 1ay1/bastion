@@ -61,6 +61,28 @@ int main() {
     fs::create_directories(secret_dir);
     { std::ofstream f(secret_dir / "flag.txt"); f << "FLAG{escaped}\n"; }
 
+    // Stage a credential file where git actually keeps one, so the check below
+    // is REAL. must_deny() passes when a command fails for any reason,
+    // including "no such file" -- so without this the most important case in
+    // this section would pass vacuously on a machine that happens not to have
+    // one. This is the file that leaked when the floor granted the directory.
+    const fs::path git_cfg_dir = fs::path{std::getenv("HOME") ? std::getenv("HOME")
+                                                              : "/tmp"} /
+                                 ".config/git";
+    const fs::path planted = git_cfg_dir / "bastion-test-credentials";
+    bool planted_ok = false;
+    {
+        std::error_code ec;
+        fs::create_directories(git_cfg_dir, ec);
+        if (!ec) {
+            std::ofstream f(planted);
+            if (f) {
+                f << "https://token:x-oauth-basic@github.com\n";
+                planted_ok = true;
+            }
+        }
+    }
+
     auto policy = Policy{Tier::Kernel}
                       .allow(Right::FsRead | Right::FsWrite, ws, "workspace")
                       .seal();
@@ -116,8 +138,34 @@ int main() {
     must_deny("~/.aws/credentials", run("cat ~/.aws/credentials 2>/dev/null"));
     must_deny("keychain", run("cat ~/Library/Keychains/* 2>/dev/null"));
     must_deny("shell history", run("cat ~/.zsh_history ~/.bash_history 2>/dev/null"));
-    must_deny("git global config", run("cat ~/.gitconfig 2>/dev/null"));
     must_deny("npmrc token", run("cat ~/.npmrc 2>/dev/null"));
+
+    // GIT CONFIG IS READABLE BY DESIGN -- and the line between "config" and
+    // "credential" is exactly where this gets dangerous.
+    //
+    // `git status` is the most common command an agent runs, and without
+    // ~/.gitconfig git does not degrade, it REFUSES: "fatal: unknown error
+    // occurred while reading the configuration files". So the floor grants it
+    // read-only.
+    //
+    // The trap, MEASURED: granting ~/.config/git as a DIRECTORY leaked
+    // ~/.config/git/credentials, git's own documented credential store,
+    // sitting beside the config file. Path-set authority covers everything
+    // beneath a directory, so the floor must name individual FILES. These
+    // cases pin that boundary in both directions.
+    must_deny("~/.git-credentials", run("cat ~/.git-credentials 2>/dev/null"));
+    if (planted_ok) {
+        must_deny("credentials INSIDE the git config dir",
+                  run("cat " + planted.string() + " 2>/dev/null"));
+    } else {
+        std::puts("  [skip] could not stage a credential file to test");
+    }
+    must_deny("gh CLI token", run("cat ~/.config/gh/hosts.yml 2>/dev/null"));
+    must_deny("~/.netrc", run("cat ~/.netrc 2>/dev/null"));
+    // Readable, but NOT writable: core.pager and core.editor are command
+    // strings git executes, so a writable .gitconfig is a persistence vector.
+    must_deny("WRITING to ~/.gitconfig",
+              run("echo '[core]' >> ~/.gitconfig 2>/dev/null"));
 
     std::puts("\n== 5b. inherited file descriptors (MEASURED escape) ==");
     // Access rights attach to the open file DESCRIPTION, not the path, on both
@@ -242,6 +290,12 @@ int main() {
                     "macOS has no PID namespace; Seatbelt cannot hide the "
                     "process table. Needs T4.");
 #endif
+    }
+
+    // Never leave a (fake) credential file behind in the user's real git dir.
+    if (planted_ok) {
+        std::error_code ec;
+        fs::remove(planted, ec);
     }
 
     std::printf("\n%s: %d escape(s), %d documented limit(s)\n",

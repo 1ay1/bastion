@@ -267,6 +267,58 @@ Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
         rs.paths.push_back({p, kReadRights | kExecRights});
     }
 
+    // VERSION CONTROL CONFIG. READ-ONLY, and under $HOME so it cannot be
+    // hardcoded in the list above.
+    //
+    // MEASURED: `git status` -- the single most common command an agent runs --
+    // failed OUTRIGHT in the sandbox:
+    //   warning: unable to access '/home/ayush/.gitconfig': Permission denied
+    //   fatal: unknown error occurred while reading the configuration files
+    // Not a degraded result: git refuses to operate at all. An agent that
+    // cannot run `git status` cannot work, and would conclude the sandbox is
+    // broken rather than that it needs a grant -- exactly the friction
+    // DESIGN.md §4 says gets sandboxes switched off.
+    //
+    // Read-only is the whole point: the agent may READ the user's identity and
+    // aliases, which is what git needs to start, but cannot rewrite them. A
+    // writable .gitconfig would be a persistence vector -- core.pager and
+    // core.editor are command strings git executes.
+    //
+    // Credentials are deliberately NOT here, and this is why the list names
+    // FILES rather than directories.
+    //
+    // MEASURED: granting ~/.config/git as a directory leaked
+    // ~/.config/git/credentials -- git's own documented credential-store
+    // location, sitting right beside the config file we wanted. A confined
+    // agent read a token straight out of it. Path-set authority grants
+    // everything BENEATH a directory, so "the config lives in that folder" is
+    // never a safe reason to grant the folder.
+    //
+    // So: only the exact files git needs to start, each named. A new config
+    // file appearing in that directory is a missing grant (a warning the user
+    // can act on), not a silent credential leak.
+    if (const char* home = std::getenv("HOME"); home && *home == '/') {
+        const std::string h{home};
+        for (const char* rel : {"/.gitconfig",
+                                "/.config/git/config",
+                                "/.config/git/attributes",
+                                "/.config/git/ignore",
+                                "/.gitignore_global",
+                                "/.hgrc"}) {
+            const std::string p = h + rel;
+            std::error_code ec;
+            // Regular files only: if any of these is a directory (or a symlink
+            // to one), granting it would reopen exactly the hole above.
+            if (!std::filesystem::is_regular_file(p, ec) || ec) continue;
+            rs.paths.push_back({p, kReadRights});
+        }
+    }
+    for (const char* p : {"/etc/gitconfig", "/etc/gitattributes"}) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p, ec) || ec) continue;
+        rs.paths.push_back({p, kReadRights});
+    }
+
     // Character devices every toolchain expects.
     for (const char* p : {"/dev/null", "/dev/zero", "/dev/urandom", "/dev/random",
                           "/dev/tty", "/dev/ptmx"}) {

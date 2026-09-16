@@ -50,6 +50,24 @@ test suite, so the documented boundary cannot drift from the enforced one.
 5. **Data already given.** Anything inside the workspace is readable by design.
    The boundary is the workspace, not the data.
 
+### The config/credential line
+
+The ergonomic floor grants **read** on a short list of tool config *files* —
+`~/.gitconfig`, `~/.config/git/config`, `/etc/gitconfig`. Without them `git`
+does not degrade, it refuses: *"fatal: unknown error occurred while reading the
+configuration files"*. An agent that cannot run `git status` cannot work.
+
+These are **files, never directories**, and that distinction is load-bearing.
+Granting `~/.config/git` as a directory leaked `~/.config/git/credentials` —
+git's own documented credential store, sitting beside the config file. Path-set
+authority covers everything beneath a directory, so *"the config lives in that
+folder"* is never a safe reason to grant the folder.
+
+Still denied, and asserted by the adversarial suite: `~/.git-credentials`,
+`~/.netrc`, `~/.config/gh/hosts.yml`, anything else inside the git config
+directory, and **writes** to `~/.gitconfig` (`core.pager` and `core.editor` are
+command strings git executes, so a writable config is a persistence vector).
+
 ---
 
 ## 2. What each tier actually promises
