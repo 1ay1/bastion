@@ -167,6 +167,45 @@ int main() {
     must_deny("WRITING to ~/.gitconfig",
               run("echo '[core]' >> ~/.gitconfig 2>/dev/null"));
 
+    // CACHE GRANTS MUST NOT REACH SECRETS. The ergonomic floor grants
+    // toolchain caches so builds do not re-download the world, and the
+    // tempting shortcut is to grant $XDG_DATA_HOME (~/.local/share) wholesale
+    // because that is where pnpm and friends keep their stores.
+    //
+    // MEASURED: doing exactly that exposed ~/.local/share/keyrings/
+    // login.keyring -- the GNOME keyring -- because that directory is general
+    // "application state", not a cache. Same trap as ~/.config/git, where
+    // granting the folder leaked the credential file sitting beside the
+    // config. "The cache lives in that directory" is never a reason to grant
+    // the directory.
+    //
+    // Staged for real, because must_deny() also passes when a file is simply
+    // absent -- without this the check would pass vacuously on any machine
+    // without a keyring.
+    {
+        const fs::path kr = fs::path{std::getenv("HOME") ? std::getenv("HOME")
+                                                          : "/tmp"} /
+                            ".local/share/keyrings";
+        std::error_code ec;
+        fs::create_directories(kr, ec);
+        const fs::path secret = kr / "bastion-test.keyring";
+        bool staged = false;
+        if (!ec) {
+            std::ofstream f(secret);
+            if (f) {
+                f << "SECRET_KEYRING_MATERIAL\n";
+                staged = true;
+            }
+        }
+        if (staged) {
+            must_deny("keyring under the granted cache root",
+                      run("cat " + secret.string() + " 2>/dev/null"));
+            fs::remove(secret, ec);
+        } else {
+            std::puts("  [skip] could not stage a keyring file to test");
+        }
+    }
+
     std::puts("\n== 5b. inherited file descriptors (MEASURED escape) ==");
     // Access rights attach to the open file DESCRIPTION, not the path, on both
     // Seatbelt and Landlock. An fd opened before confinement therefore keeps

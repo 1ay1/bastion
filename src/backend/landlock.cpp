@@ -400,12 +400,59 @@ Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
         //
         // Only paths that already EXIST are granted, so this never invents
         // authority for a toolchain the user does not have installed.
+        //
+        // Granted as the standard cache ROOTS rather than as a list of
+        // per-tool directories. MEASURED: an enumerated list had ~/.cargo,
+        // ~/.npm and ~/.cache/pip but not ~/.local/share/pnpm or
+        // ~/.bun/install/cache, so pnpm and bun -- both mainstream -- silently
+        // could not cache. That is the same shape as the $PATH bug: a
+        // hand-maintained list of "where tools put things" is never finished,
+        // and every gap is the same issue reported by a different user.
+        //
+        // $XDG_CACHE_HOME (default ~/.cache) is where the convention says
+        // caches live, so granting that ROOT is safe and complete: by
+        // definition nothing in it is precious.
+        //
+        // $XDG_DATA_HOME (~/.local/share) is NOT safe to grant wholesale, and
+        // this was MEASURED the hard way -- a first version granted it and
+        // immediately exposed ~/.local/share/keyrings/login.keyring, the GNOME
+        // keyring. It is a general "application state" directory that holds
+        // secrets right beside package caches. Same trap as ~/.config/git,
+        // where granting the folder leaked the credential file next to the
+        // config: "the cache lives in that directory" is never a reason to
+        // grant the directory.
+        //
+        // So the data root is entered by NAMED subdirectory only.
         if (const char* home = std::getenv("HOME"); home && *home == '/') {
             const std::string h{home};
-            for (const char* rel : {"/.cargo", "/.rustup", "/.cache/go-build",
-                                    "/go/pkg/mod", "/.npm", "/.cache/pip",
-                                    "/.ccache", "/.cache/zig",
-                                    "/.cache/uv", "/.cache/yarn"}) {
+
+            // The cache root, honouring an override if the user set one.
+            if (const char* xc = std::getenv("XDG_CACHE_HOME");
+                xc && *xc == '/') {
+                tmp_dirs.emplace_back(xc);
+            } else {
+                tmp_dirs.push_back(h + "/.cache");
+            }
+
+            // Package managers that keep their store under the DATA root.
+            // Named individually, never the root itself.
+            const std::string data =
+                [&]() -> std::string {
+                    if (const char* xd = std::getenv("XDG_DATA_HOME");
+                        xd && *xd == '/') {
+                        return xd;
+                    }
+                    return h + "/.local/share";
+                }();
+            for (const char* rel : {"/pnpm", "/pnpm-store", "/virtualenv",
+                                    "/uv", "/mise", "/hatch"}) {
+                tmp_dirs.push_back(data + rel);
+            }
+
+            // Tools that predate XDG and keep their cache in $HOME directly.
+            for (const char* rel : {"/.cargo", "/.rustup", "/go/pkg/mod",
+                                    "/.npm", "/.bun", "/.ccache", "/.m2",
+                                    "/.gradle", "/.pub-cache", "/.nuget"}) {
                 tmp_dirs.push_back(h + rel);
             }
         }
