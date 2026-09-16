@@ -298,6 +298,35 @@ EOF
   rm -rf "$OLD"
 fi
 
+# ---------------------------------------------------------------------------
+# DOES THE NON-LINUX BRANCH STILL COMPILE?
+#
+# Nothing on Linux compiles the `#else` halves of the platform splits, so they
+# ROT SILENTLY and only macOS CI notices -- one round-trip per bug, blind.
+# MEASURED: the non-Linux compile() stub still returned a bare `Ruleset` with
+# an `.error` field long after the signature became Result<Ruleset> and Ruleset
+# deliberately lost that field. A plain type error, invisible here for weeks.
+#
+# This does not make macOS VERIFIED -- it runs nothing, and glibc is not
+# Apple's libc. It only catches the class that bit us: signatures that drifted
+# and headers that are missing. Cheap, and it turns a CI round-trip into a
+# local error.
+if [ "$(uname -s)" = "Linux" ]; then
+  ok=1
+  for f in "$ROOT/src/backend/landlock.cpp" "$ROOT/src/observe.cpp"; do
+    # -U__linux__ takes the non-Linux path; -D__APPLE__ is NOT set, because
+    # that would pull in Darwin-only headers this machine does not have.
+    if ! c++ -std=$STD -U__linux__ -I"$ROOT/include" -fsyntax-only "$f" \
+         2>/tmp/bastion-nonlinux.log; then
+      echo "FAIL: $(basename "$f") does not compile with __linux__ undefined"
+      head -12 /tmp/bastion-nonlinux.log
+      ok=0
+      fail=1
+    fi
+  done
+  [ "$ok" -eq 1 ] && echo "OK: the non-Linux branch still compiles"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "FAILED: Linux spawn path is out of sync with the Landlock backend"
   exit 1

@@ -41,7 +41,13 @@ extern "C" void forward_to_child(int sig) {
 SignalForwarder::SignalForwarder(pid_t child_pgid) noexcept {
     g_child_pgid = static_cast<std::sig_atomic_t>(child_pgid);
     for (std::size_t i = 0; i < kCount; ++i) {
-        struct sigaction sa {};
+        // `struct sigaction sa {}` is ambiguous where sigaction is ALSO a
+        // function (it is, on macOS): clang parses the braces as a function
+        // declarator and reports "expected unqualified-id". Naming the type
+        // without the elaborated-specifier, then value-initialising, is
+        // unambiguous on both platforms.
+        struct sigaction sa;
+        sa = {};
         sa.sa_handler = forward_to_child;
         ::sigemptyset(&sa.sa_mask);
         // Deliberately NOT SA_RESTART: waitpid() should return EINTR so the

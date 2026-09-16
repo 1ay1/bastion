@@ -810,10 +810,13 @@ std::size_t AbiCore::ruleset_attr_size() const noexcept { return 0; }
 // anything that reports a boundary fails to link on this platform.
 bool Ruleset::PathRule::writable() const noexcept { return false; }
 
-Ruleset compile(const Sealed&, const AbiInfo& abi, std::uint16_t) {
-    Ruleset rs;
-    rs.error = abi.note;
-    return rs;
+// The stub had rotted: it still returned a bare `Ruleset` with an `.error`
+// field, from before compile() became Result<Ruleset> and Ruleset lost its
+// {ok, error} shape on purpose (see the header). Nothing on Linux compiles
+// this branch, so it broke silently and only macOS CI could see it.
+Result<Ruleset> compile(const Sealed&, const AbiInfo& abi, std::uint16_t) {
+    return Error{abi.note.empty() ? "Landlock backend not compiled in"
+                                  : abi.note};
 }
 
 std::string apply(const Sealed&, std::uint16_t) {
