@@ -137,6 +137,18 @@ if(BASTION_BUILD_TESTS)
              COMMAND ${CMAKE_COMMAND} -E env sh
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_landlock.sh)
 
+    # DOCS: every number quoted in the README/DESIGN/security-model must come
+    # from a run. The adversarial suite prints its own totals; this diffs the
+    # prose against them, so adding an attack fails the build until the claim
+    # is corrected. Stale security numbers are worse than absent ones.
+    add_test(NAME claims
+             COMMAND ${CMAKE_COMMAND} -E env sh
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_claims.sh
+                     $<TARGET_FILE:adversarial_test>
+                     ${CMAKE_CURRENT_BINARY_DIR}
+                     ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(claims PROPERTIES TIMEOUT 120)
+
     # Negative compile tests: each case MUST be rejected by the type system.
     # A "compile error" security claim is worthless if it is never verified.
     foreach(case 1 2 3 4)

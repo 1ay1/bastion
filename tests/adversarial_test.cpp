@@ -23,20 +23,30 @@ namespace fs = std::filesystem;
 static int failures = 0;
 static int known_limits = 0;
 
+// The suite counts itself. Every number the README and security-model quote
+// comes from the summary line below, and tools/check_claims.sh fails the build
+// if a doc drifts from it -- otherwise "27 attempts" outlives the 27th attempt.
+static int attempts = 0;    // things an attacker tries and must not get
+static int positives = 0;   // things a legitimate agent does and must get
+
 static void must_deny(const char* attack, const SpawnResult& r) {
     const bool blocked = r.launched() && r.exit_code != 0;
+    ++attempts;
     std::printf("  [%s] %s\n", blocked ? "BLOCKED" : "ESCAPED!", attack);
     if (!blocked) ++failures;
 }
 
 static void must_allow(const char* what, const SpawnResult& r) {
     const bool ok = r.launched() && r.exit_code == 0;
+    ++positives;
     std::printf("  [%s] %s\n", ok ? "OK" : "BROKEN", what);
     if (!ok) ++failures;
 }
 
-// A limit we accept and document at this tier.
+// A limit we accept and document at this tier. It is still an ATTEMPT: the
+// attacker tries it either way, and whether it lands is what the tier decides.
 static void known_limit(const char* what, bool escaped, const char* why) {
+    ++attempts;
     std::printf("  [%s] %s\n", escaped ? "LIMIT" : "BLOCKED", what);
     if (escaped) {
         std::printf("          -> %s\n", why);
@@ -382,6 +392,10 @@ int main() {
     std::printf("\n%s: %d escape(s), %d documented limit(s)\n",
                 failures == 0 ? "NO ESCAPES" : "SANDBOX ESCAPED",
                 failures, known_limits);
+    // Machine-readable, for tools/check_claims.sh. Docs quote these; the script
+    // greps them back out and diffs, so a new attack updates the prose too.
+    std::printf("CLAIMS attempts=%d escapes=%d limits=%d positives=%d\n",
+                attempts, failures, known_limits, positives);
     return failures == 0 ? 0 : 1;
 #endif
 }

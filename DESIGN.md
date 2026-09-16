@@ -272,7 +272,7 @@ sandbox that is only safe when every caller is careful is not a boundary.
 
 ### 6.2 Verified with adversarial tests, not assertions
 
-`tests/adversarial_test.cpp` runs 27 real escape attempts: **0 escapes**.
+`tests/adversarial_test.cpp` runs 35 real escape attempts: **0 escapes**.
 
 | Class | Attempts | Notable |
 |---|---|---|
@@ -280,11 +280,16 @@ sandbox that is only safe when every caller is careful is not a boundary.
 | Path traversal | 4 | `../`, `.././`, `//double//slash` |
 | Sibling-prefix confusion | 1 | `/x/ws` must not authorize `/x/ws-secret` |
 | Re-confinement / regain | 3 | copy `sh` into workspace and exec it; nested subshells |
-| Credential theft | 6 | `~/.ssh`, `~/.aws`, keychain, history, `.gitconfig`, `.npmrc` |
+| Credential theft | 11 | `~/.ssh`, `~/.aws`, keyring, history, `.gitconfig`, `.npmrc`, cloud tokens |
 | Inherited descriptors | 2 | raw `read(2)` and `/dev/fd/N` (§6.1) |
-| Environment hygiene | 1 | `DYLD_INSERT_LIBRARIES` + `*_TOKEN` stripped |
 | Persistence writes | 4 | `/etc`, `~/.zshrc`, `/usr/local/bin`, LaunchAgents |
-| Workspace still usable | 4 | write, read, mkdir, rename |
+| Tier limits, and T3 closing them | 6 | egress, raw socket, PID table, `/`, `/home`, `/etc/shadow` |
+| Path *existence* probing | 1 | the one documented limit; asserted both ways |
+| Environment hygiene | 1 | `DYLD_INSERT_LIBRARIES` + `*_TOKEN` stripped (positive) |
+| Workspace still usable | 4 | write, read, mkdir, rename (positives) |
+
+The last two rows are positives, not attacks — they are what stops a sandbox
+that denies everything from passing this suite.
 
 The symlink cases are the field report's own workaround, run as an attack: under
 `bwrap` a symlink farm over-grants, whereas path-set authority denies all three.

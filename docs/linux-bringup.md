@@ -4,8 +4,9 @@ Everything you need to get bastion enforcing on Linux.
 
 **STATUS: the Landlock backend now runs, enforces, and passes its full suite on
 a real kernel.** First bring-up measured on **kernel 7.2.2-zen1 (Landlock ABI
-v10), GCC 16.2.1**: 30/30 tests green, adversarial suite 30 attempts / 0
-escapes, T3 per-host egress verified end to end against a live host.
+v10), GCC 16.2.1**: 31/31 tests green, adversarial suite 35 attempts / 0
+escapes / 1 documented limit, T3 per-host egress verified end to end against a
+live host.
 
 Five real bugs were found the moment it touched hardware; all are fixed, and
 each is recorded as a MEASURED comment at the site so it cannot silently
@@ -100,9 +101,20 @@ That removed the last entry from the adversarial suite's "documented limits":
   [BLOCKED] T3: egress to a non-allowlisted host
   [BLOCKED] T3: raw socket bypassing the broker
   [BLOCKED] T3: enumerate host processes
+  [BLOCKED] T3: list the root directory
+  [BLOCKED] T3: enumerate /home
+  [BLOCKED] T3: read /etc/shadow
+  [LIMIT] path existence is probeable
 
-NO ESCAPES: 0 escape(s), 0 documented limit(s)
+NO ESCAPES: 0 escape(s), 1 documented limit(s)
 ```
+
+The single remaining LIMIT is the one Landlock cannot close without changing
+the mount topology: `stat(2)` still distinguishes *exists* from *absent* on a
+denied path, because traversal metadata has to be granted for nested rules to
+resolve at all. Contents and listings stay denied. That trade is measured and
+argued in `docs/security-model.md` §5; both directions are asserted in the
+suite, so it cannot quietly widen or quietly close.
 
 Two further bugs surfaced in the process, both found by tests rather than by
 inspection:
@@ -301,7 +313,7 @@ Work top to bottom. Each item is a claim that is currently **unverified**.
 ### 6.1 Basics
 
 - [x] `bastion doctor` reports `landlock` and the expected ABI version (v10)
-- [x] `ctest` passes — 30/30 on 7.2.2
+- [x] `ctest` passes — 31/31 on 7.2.2
 - [x] Write inside the workspace succeeds
 - [x] Read outside the workspace fails
 - [x] `/etc/shadow`, `~/.ssh`, `~/.aws` all denied

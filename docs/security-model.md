@@ -88,10 +88,17 @@ and learning what a workload needs — not for containment.
 
 ## 3. Measured results
 
-All on macOS 26.6.2 / arm64 / Apple clang 21. **Linux is unverified** — see
-`docs/linux-bringup.md`.
+All on **Linux, kernel 7.2.2-zen1, Landlock ABI v10, GCC 16.2.1**. The macOS
+Seatbelt backend still compiles and is syntax-checked in CI, but it has not
+been re-run since the Linux hardening work — treat every macOS-specific claim
+below as **unverified**.
 
-### 3.1 Adversarial suite: 29 attempts, 0 escapes
+The numbers in this section are not maintained by hand. `tests/adversarial_test`
+prints its own totals and `tools/check_claims.sh` (a `ctest` case) diffs them
+against this file, the README, DESIGN.md and the architecture doc. Add an
+attack and the build fails until the prose is corrected.
+
+### 3.1 Adversarial suite: 35 attempts, 0 escapes
 
 | Class | Attempts | Result |
 |---|---|---|
@@ -99,15 +106,25 @@ All on macOS 26.6.2 / arm64 / Apple clang 21. **Linux is unverified** — see
 | Path traversal (`../`, `.././`, `//`) | 4 | Blocked |
 | Sibling-prefix confusion | 1 | Blocked |
 | Re-confinement / privilege regain | 3 | Blocked |
-| Credential theft (`~/.ssh`, `~/.aws`, keychain, history, `.gitconfig`, `.npmrc`) | 6 | Blocked |
+| Credential theft (`~/.ssh`, `~/.aws`, keyring, history, `.gitconfig`, `.npmrc`, cloud tokens) | 11 | Blocked |
 | Inherited descriptors | 2 | Blocked (§4.1) |
-| Environment hygiene | 1 | Stripped |
 | Persistence writes (`/etc`, `~/.zshrc`, `/usr/local/bin`, LaunchAgents) | 4 | Blocked |
-| T3 egress bypass (proxy skip, raw socket) | 2 | Blocked |
-| Workspace remains usable | 4 | Works |
+| T2 limits, and T3 closing them (egress, raw socket, PID table, `/`, `/home`, `/etc/shadow`) | 6 | Blocked |
+| Path *existence* probing | 1 | **Limit** (§5) |
+| — | | |
+| Workspace remains usable (write, read back, mkdir, rename) | 4 | Works |
+| Environment hygiene (secrets + `DYLD_*` stripped) | 1 | Works |
+
+The last two rows are not attacks: they are the assertions that stop this from
+being passed by a sandbox that denies everything. The suite fails if a
+legitimate agent action stops working, exactly as it fails on an escape.
 
 The symlink cases are the *field report's own workaround* run as an attack:
 under `bwrap` a symlink farm over-grants; path-set authority denies all three.
+
+The one LIMIT row is the subject of §5 — it is asserted in both directions, so
+if a future change closes it the test fails and this doc must be corrected
+upward.
 
 ### 3.2 Type-level claims
 

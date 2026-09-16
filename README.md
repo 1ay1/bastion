@@ -14,7 +14,7 @@ bastion run --policy bastion.toml -- ./legacy-build.sh
 
 | | |
 |---|---|
-| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 30/30 tests, 34 adversarial escape attempts, **0 escapes**. One residual limit is named and asserted rather than hidden — path *existence* is probeable, though contents are not. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
+| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 31/31 tests, 35 adversarial escape attempts, **0 escapes**. One residual limit is named and asserted rather than hidden — path *existence* is probeable, though contents are not. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
 | **macOS** | Best-effort. A Seatbelt backend exists and the shared code is syntax-checked for `__APPLE__` in CI, but it has **not been run or measured** since the Linux hardening work. Treat it as unverified. |
 | **Windows** | Specified only (AppContainer + restricted token). Not implemented. |
 
@@ -163,10 +163,12 @@ negative_compile_4 ... Passed   # laundering Unconfined in with normal rights
 
 ## Verified, not asserted
 
-**29 real escape attempts, 0 escapes** — symlink farms pointed at `/etc` and
+**35 real escape attempts, 0 escapes** — symlink farms pointed at `/etc` and
 `/`, `../` traversal, sibling-prefix confusion, copying `sh` into the workspace
-to shed policy, `~/.ssh` + `~/.aws` + keychain + shell history,
+to shed policy, `~/.ssh` + `~/.aws` + keyring + shell history,
 `DYLD_INSERT_LIBRARIES` injection, LaunchAgent persistence, T3 proxy bypass.
+The count is printed by the suite and checked against this file by `ctest`, so
+it cannot go stale.
 
 **The escape this found:** on both Seatbelt and Landlock, access rights attach to
 the **open file description**, not the path. A descriptor opened *before*
@@ -193,7 +195,7 @@ at T3.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
-(cd build && ctest --output-on-failure)     # 30/30
+(cd build && ctest --output-on-failure)     # 31/31
 
 ./build/bastion doctor
 ```

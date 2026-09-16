@@ -331,7 +331,7 @@ never-touched paths stay denied.
 | `cap` + `negative_compile_1..4` | Type-level claims, including 4 that must NOT compile |
 | `policy` | Evaluation, canonicalization, builder regression |
 | `live_enforcement` | Real processes, real kernel denials |
-| `adversarial` | 29 escape attempts; a failure here is an escape |
+| `adversarial` | 35 escape attempts; a failure here is an escape |
 | `closed_loop` | Synthesized policies actually run |
 | `egress` | T3 both halves: allowlist *and* kernel pin |
 | `landlock_uapi` | Linux UAPI usage + spawn wiring, from macOS |
