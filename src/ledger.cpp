@@ -67,6 +67,39 @@ std::string rights_to_cpp(Right r) {
 // these bloats a synthesized policy with noise (dyld, locale tables, /bin/sh
 // itself) and hides the handful of grants that actually matter.
 //
+// Does this path look like a one-shot scratch file?
+//
+// Compiler and linker temporaries carry a random component by construction, so
+// the exact name never recurs: gcc emits /tmp/ccXXXXXX.s and .o, ld uses
+// ccXXXXXX.res, mktemp-style tools use a .tmp suffix or a dot-prefixed
+// sibling. Granting those by name authorises a file that will never exist
+// again, while making the policy look tighter than it is.
+//
+// Deliberately conservative: it matches shapes, not directories. A real source
+// file that happens to live in /tmp is still granted, because the test is on
+// the FILENAME pattern rather than on where it sits.
+bool is_transient(std::string_view path) {
+    const auto slash = path.find_last_of('/');
+    const std::string_view name =
+        slash == std::string_view::npos ? path : path.substr(slash + 1);
+    if (name.empty()) return false;
+
+    // gcc/clang scratch: ccXXXXXX.{s,o,res,le,lto}
+    if (name.starts_with("cc") && name.size() >= 8) {
+        const auto dot = name.find_last_of('.');
+        if (dot != std::string_view::npos && dot >= 8) return true;
+    }
+    // Generic temp shapes every toolchain produces.
+    for (std::string_view suffix : {".tmp", ".swp", ".lock", ".pid"}) {
+        if (name.ends_with(suffix)) return true;
+    }
+    // mktemp(1) and friends: a long run of random-looking characters with no
+    // vowels is a strong signal, but too clever to rely on -- restrict to the
+    // explicit `tmp`/`temp` prefixes instead, which is what tools actually use.
+    if (name.starts_with("tmp.") || name.starts_with("temp.")) return true;
+    return false;
+}
+
 // Observation sees EVERYTHING a process touches, including all the machinery
 // the base profile grants anyway -- 48 raw records for a shell that read one
 // file. Filtering here is what makes the output reviewable.
@@ -74,12 +107,25 @@ bool covered_by_floor(std::string_view op, std::string_view path) {
     if (op == "fs.stat") return true;  // traversal metadata, always granted
 
     static constexpr std::string_view kFloorRead[] = {
+        // macOS
         "/usr/lib", "/usr/share", "/System", "/Library/Preferences",
         "/private/var/db/dyld", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
         "/private/var/select", "/Library/Developer", "/Applications/Xcode.app",
         "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", "/dev/tty",
         "/dev/dtracehelper", "/dev/fd", "/dev/stdout", "/dev/stderr",
         "/dev/stdin", "/dev/ptmx", "/dev/console",
+        // Linux. This list had drifted from what the Landlock backend actually
+        // grants, so every synthesized policy carried rules for paths the floor
+        // already covered -- /etc/ld.so.cache appeared in a five-rule policy
+        // for a one-file build, which is exactly the noise that makes a policy
+        // go unread. Kept in step with kBaseRead in backend/landlock.cpp.
+        "/usr", "/lib", "/lib64", "/etc/ld.so.cache", "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d", "/etc/alternatives", "/etc/localtime",
+        "/proc/self", "/sys/devices/system/cpu",
+        "/etc/ssl", "/etc/pki", "/etc/ca-certificates",
+        "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
+        "/etc/host.conf", "/etc/services", "/etc/gai.conf",
+        "/etc/gitconfig", "/etc/gitattributes",
     };
     for (auto f : kFloorRead) {
         if (path == f) return true;
@@ -184,6 +230,40 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
             ++syn.floor_filtered;
             continue;
         }
+
+        // PHANTOM PATHS. A PATH search probes every directory in $PATH, so a
+        // single `cc` invocation is observed opening /usr/local/sbin/cc,
+        // /usr/local/bin/cc and ~/.local/bin/cc -- none of which exist. All
+        // three became exec grants while the one that DID run (/usr/bin/cc,
+        // already in the floor) did not appear at all. MEASURED on a one-file
+        // build: three of twenty-seven rules authorised nothing whatsoever.
+        //
+        // A grant for a path that does not exist cannot describe a real need,
+        // and it makes the policy look like it permits more than it does.
+        //
+        // FILESYSTEM RIGHTS ONLY. A net.egress target is "host:port", not a
+        // path -- testing it with exists() deleted every network grant, which
+        // the first version of this filter did. Anything that is not a
+        // filesystem right passes straight through.
+        const bool is_fs_right =
+            any(rr & (Right::FsRead | Right::FsWrite | Right::FsExec));
+        if (is_fs_right) {
+            std::error_code ec;
+            if (!std::filesystem::exists(r.target, ec) || ec) {
+                ++syn.floor_filtered;
+                continue;
+            }
+            // TRANSIENT PATHS. The compiler's scratch files (/tmp/ccw7tpAM.s,
+            // /tmp/ccfRxBuC.o) exist only during the observed run and never
+            // again. Granting them by name authorises nothing on the next
+            // build while suggesting the policy is tighter than it is -- the
+            // directory grant that matters is emitted by write-coalescing.
+            if (is_transient(r.target)) {
+                ++syn.floor_filtered;
+                continue;
+            }
+        }
+
         need[std::to_underlying(rr)].insert(r.target);
     }
 
@@ -239,6 +319,36 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
 
         for (const auto& t : targets) {
             if (!covered.contains(t)) emitted.insert(t);
+        }
+
+        // ANCESTOR PRUNING. Coalescing only folds DIRECT children into their
+        // parent, so a deep tree survives as a chain of redundant rules:
+        // /usr/include, /usr/include/bits and /usr/include/bits/types all
+        // appeared, though path-set authority makes the first subsume both
+        // others. MEASURED on a one-file build: six of twenty-seven rules were
+        // descendants of another rule in the same set.
+        //
+        // Every extra line is a line a reviewer must read and judge, and an
+        // unreviewable policy is one that gets --yolo'd. Removing a rule whose
+        // authority is already granted changes nothing about what the sandbox
+        // permits -- only how much of it a human has to hold in their head.
+        {
+            std::set<std::string> pruned;
+            for (const auto& scope : emitted) {
+                bool shadowed = false;
+                for (const auto& other : emitted) {
+                    if (other == scope) continue;
+                    // `other` is an ancestor directory of `scope`.
+                    if (scope.size() > other.size() &&
+                        scope.starts_with(other) &&
+                        scope[other.size()] == '/') {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if (!shadowed) pruned.insert(scope);
+            }
+            emitted = std::move(pruned);
         }
 
         for (const auto& scope : emitted) {

@@ -38,8 +38,16 @@ int main() {
             r.target = target;
             led.record(r);
         };
-        add("fs.read", "/proj/src/a.cpp");
-        add("fs.write", "/proj/out/bin");
+        // Staged for real: the phantom filter drops grants whose path does
+        // not exist, so notional paths would test that filter instead of the
+        // round trip this section is about.
+        fs::create_directories("/tmp/bastion-pf-proj/src");
+        fs::create_directories("/tmp/bastion-pf-proj/out");
+        std::ofstream{"/tmp/bastion-pf-proj/src/a.cpp"} << "int x;\n";
+        std::ofstream{"/tmp/bastion-pf-proj/out/bin"} << "bin\n";
+
+        add("fs.read", "/tmp/bastion-pf-proj/src/a.cpp");
+        add("fs.write", "/tmp/bastion-pf-proj/out/bin");
         add("net.egress", "registry.npmjs.org:443");
 
         const std::string toml = synthesize(led).to_toml();
@@ -57,9 +65,9 @@ int main() {
 
         bool r = false, w = false, n = false, wr = false;
         for (const auto& rule : pf.rules) {
-            if (rule.scope == "/proj/src/a.cpp" && any(rule.right & Right::FsRead)) r = true;
-            if (rule.scope == "/proj/out" && any(rule.right & Right::FsWrite)) w = true;
-            if (rule.scope == "/proj/out" && any(rule.right & Right::FsRead)) wr = true;
+            if (rule.scope == "/tmp/bastion-pf-proj/src/a.cpp" && any(rule.right & Right::FsRead)) r = true;
+            if (rule.scope == "/tmp/bastion-pf-proj/out" && any(rule.right & Right::FsWrite)) w = true;
+            if (rule.scope == "/tmp/bastion-pf-proj/out" && any(rule.right & Right::FsRead)) wr = true;
             if (rule.scope == "registry.npmjs.org:443" &&
                 any(rule.right & Right::NetEgress)) n = true;
         }
