@@ -64,7 +64,33 @@ int main() {
     // Coalescing: 4 files under /proj/src should collapse to the directory.
     check(has(toml, "/proj/src\""), "sibling reads coalesced to /proj/src");
     check(!has(toml, "/proj/src/a.cpp"), "individual files not emitted");
-    check(has(toml, "/proj/build/out.o"), "lone write emitted individually");
+
+    // A WRITE coalesces to its directory from a SINGLE observation, unlike a
+    // read. This test previously asserted the opposite -- that a lone write
+    // stayed a per-file grant -- and that was measured to be wrong in the one
+    // way that matters: the resulting policy could not be re-used.
+    //
+    // A build's outputs are NEW files every run (the compiler's temp object,
+    // the linked binary), so a grant naming /proj/build/out.o authorises
+    // exactly one historical file and nothing the next build creates. The
+    // policy worked only for the run it was derived from, which defeats the
+    // observe -> synthesize -> run loop entirely.
+    check(has(toml, "/proj/build\""),
+          "a lone write coalesces to its DIRECTORY, so new outputs work");
+    check(!has(toml, "/proj/build/out.o"),
+          "...and the one-shot per-file grant is gone");
+
+    // Writing into a directory requires READ on it too: Landlock needs read to
+    // resolve a path inside a directory, so a write-only grant means `ld`
+    // cannot create its output there.
+    {
+        const auto bpos = toml.find("/proj/build\"");
+        const bool paired =
+            bpos != std::string::npos &&
+            toml.find("fs.read", bpos) != std::string::npos;
+        check(paired, "a write-coalesced directory also gets fs.read");
+    }
+
     check(has(toml, "registry.npmjs.org:443"), "egress grant preserved");
 
     // THE security property: a denied operation must never become a grant.

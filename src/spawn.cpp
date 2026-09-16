@@ -90,6 +90,33 @@ constexpr bool is_fatal_stage(ChildStage s) noexcept {
 // sandbox ends up switched off. So: prefer the widest writable grant (the
 // workspace), else a readable grant, else $TMPDIR.
 std::string choose_cwd(const Sealed& policy) {
+    // PREFER THE DIRECTORY THE USER IS STANDING IN, if the policy grants it.
+    //
+    // MEASURED: a synthesized policy contains grants for several directories
+    // (the workspace, /tmp, toolchain caches). Picking the first writable one
+    // in rule order dropped the child into /tmp, so `bastion run --policy p
+    // -- cc m.c` failed with "m.c: No such file or directory" -- the file was
+    // right there in the user's cwd. Every relative path an agent uses is
+    // relative to where it invoked bastion, so that is the only cwd that does
+    // not silently break them.
+    std::error_code cec;
+    const auto here = std::filesystem::current_path(cec);
+    if (!cec) {
+        const std::string cwd = here.string();
+        for (const auto& r : policy.rules()) {
+            if (r.scope == "*") continue;
+            if (!any(r.right & (Right::FsRead | Right::FsWrite))) continue;
+            // Granted exactly, or as an ancestor (path-set authority covers
+            // everything beneath a granted directory).
+            if (cwd == r.scope ||
+                (cwd.size() > r.scope.size() && cwd.starts_with(r.scope) &&
+                 cwd[r.scope.size()] == '/')) {
+                return cwd;
+            }
+        }
+    }
+
+    // Otherwise fall back to a granted directory, preferring a writable one.
     const std::string* read_only = nullptr;
     for (const auto& r : policy.rules()) {
         if (r.scope == "*") continue;

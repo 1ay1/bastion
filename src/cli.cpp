@@ -714,6 +714,24 @@ int cmd_synthesize(const Args& a) {
     }
     auto syn = synthesize(*led);
     std::printf("%s", syn.to_toml().c_str());
+
+    // Close the loop. The policy goes to STDOUT so it can be redirected; the
+    // instructions go to STDERR so they never end up inside the file. Without
+    // this the command just stops, and the user is left holding a policy with
+    // no idea that `--policy` is what consumes it -- the on-ramp (DESIGN.md
+    // §1) only works if its last step is discoverable.
+    if (!syn.rules.empty()) {
+        std::fprintf(stderr,
+            "\nbastion: %zu grant(s) from %zu observed operation(s).\n"
+            "         save:   bastion synthesize > bastion.toml\n"
+            "         check:  bastion explain --policy bastion.toml\n"
+            "         use:    bastion run --policy bastion.toml -- <cmd>\n"
+            "\n"
+            "         Review it first: these grants describe what the workload "
+            "DID,\n"
+            "         which is not always what it SHOULD be allowed to do.\n",
+            syn.rules.size(), syn.observations);
+    }
     return 0;
 }
 

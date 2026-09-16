@@ -47,17 +47,25 @@ int main() {
         check(parsed.ok(), "synthesize output parses");
         if (!parsed) std::printf("      error: %s\n", parsed.error().c_str());
         const auto& pf = parsed.value();
-        check(pf.rules.size() == 3, "all three grants survived the round trip");
 
-        bool r = false, w = false, n = false;
+        // FOUR blocks, not three: a write coalesces to its DIRECTORY (so the
+        // policy still works when the build writes a differently-named output
+        // next time), and a directory you write into also needs read, which a
+        // policy file must spell as its own [[allow]] block.
+        check(pf.rules.size() == 4,
+              "every grant survived the round trip (write emits a paired read)");
+
+        bool r = false, w = false, n = false, wr = false;
         for (const auto& rule : pf.rules) {
             if (rule.scope == "/proj/src/a.cpp" && any(rule.right & Right::FsRead)) r = true;
-            if (rule.scope == "/proj/out/bin" && any(rule.right & Right::FsWrite)) w = true;
+            if (rule.scope == "/proj/out" && any(rule.right & Right::FsWrite)) w = true;
+            if (rule.scope == "/proj/out" && any(rule.right & Right::FsRead)) wr = true;
             if (rule.scope == "registry.npmjs.org:443" &&
                 any(rule.right & Right::NetEgress)) n = true;
         }
         check(r, "fs.read rule preserved");
-        check(w, "fs.write rule preserved");
+        check(w, "fs.write rule coalesced to the output DIRECTORY");
+        check(wr, "...and paired with the read it needs to create files there");
         check(n, "net.egress rule preserved");
     }
 

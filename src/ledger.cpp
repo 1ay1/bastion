@@ -31,6 +31,15 @@ Right right_for_op(std::string_view op) {
     return Right::None;
 }
 
+// The single op name that best describes a right set.
+//
+// NOTE the lossiness, which is deliberate but load-bearing: a rule carrying
+// Read|Write collapses to "fs.write". A policy FILE has one op per [[allow]]
+// block, so synthesize() emits a separate block for the read -- see to_toml().
+// Emitting only the write produced a directory the workload could not create
+// files in: Landlock needs read on a directory to resolve a path inside it, so
+// `ld` failed with "cannot open output file: Permission denied" under a policy
+// that plainly said fs.write on that very directory.
 std::string_view op_for_right(Right r) {
     if (any(r & Right::FsWrite))   return "fs.write";
     if (any(r & Right::FsExec))    return "fs.exec";
@@ -189,11 +198,31 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
             for (const auto& t : targets) parent_count[parent_of(t)]++;
         }
 
+        // A WRITE is coalesced to its directory even from a single observation.
+        //
+        // MEASURED: observing `cc m.c -o m` yields one write (m) and two reads
+        // in the workspace -- all below the threshold, so the policy granted
+        // three individual FILE paths. Re-running it then failed, because a
+        // build's outputs are NEW files every time: the compiler's temp object
+        // (/tmp/ccSTSQAG.o) and any renamed output were never covered. The
+        // synthesized policy only worked for the exact run it was derived
+        // from, which defeats the entire on-ramp.
+        //
+        // Creating a file requires authority over the DIRECTORY, so a write
+        // grant on a path is evidence the directory is a work area. Reads keep
+        // the higher threshold: reading one file is not evidence you need its
+        // whole directory, and over-granting reads is how a sandbox quietly
+        // stops confining anything.
+        const bool writes = any(r & Right::FsWrite);
+        const std::size_t threshold =
+            writes ? 1 : opts.coalesce_threshold;
+
         std::set<std::string> emitted;
+        std::set<std::string> emitted_dirs;  // the coalesced ones only
         std::set<std::string> covered;
 
         for (const auto& [dir, count] : parent_count) {
-            if (count < opts.coalesce_threshold) continue;
+            if (count < threshold) continue;
             if (is_forbidden_widening(dir, opts)) {
                 syn.notes.push_back(
                     "declined to coalesce " + std::to_string(count) +
@@ -202,6 +231,7 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
                 continue;
             }
             emitted.insert(dir);
+            emitted_dirs.insert(dir);
             for (const auto& t : targets) {
                 if (parent_of(t) == dir) covered.insert(t);
             }
@@ -212,7 +242,23 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
         }
 
         for (const auto& scope : emitted) {
-            syn.rules.push_back(Rule{r, scope, "synthesized from observed use"});
+            Right granted = r;
+            // A directory you may WRITE into must also be READable: Landlock
+            // needs read on a directory to resolve a path inside it, so a
+            // write-only grant means `ld` cannot create its output there --
+            // "cannot open output file: Permission denied" under a policy that
+            // plainly says fs.write on that directory. Only applied to the
+            // coalesced DIRECTORY rules, not to individual files, so this
+            // widens nothing the write grant did not already imply.
+            if (writes && emitted_dirs.contains(scope)) {
+                // operator| is consteval by design (rights are meant to be
+                // composed at compile time), so combine through the underlying
+                // bits rather than weakening that guarantee for every caller.
+                granted = static_cast<Right>(std::to_underlying(granted) |
+                                             std::to_underlying(Right::FsRead));
+            }
+            syn.rules.push_back(
+                Rule{granted, scope, "synthesized from observed use"});
         }
     }
 
@@ -252,6 +298,19 @@ std::string Synthesis::to_toml() const {
           << "op    = \"" << op_for_right(r.right) << "\"\n"
           << "path  = \"" << r.scope << "\"\n"
           << "why   = \"" << r.provenance << "\"\n\n";
+
+        // A policy file carries ONE op per block, but a right set can hold
+        // several. op_for_right() reports the strongest, so a Read|Write grant
+        // would silently lose its read -- and a write-only directory is one
+        // Landlock cannot create files in (`ld: cannot open output file`).
+        // Emit the companion block rather than dropping the right.
+        if (any(r.right & Right::FsWrite) && any(r.right & Right::FsRead)) {
+            o << "[[allow]]\n"
+              << "op    = \"fs.read\"\n"
+              << "path  = \"" << r.scope << "\"\n"
+              << "why   = \"" << r.provenance
+              << " (read is required to write here)\"\n\n";
+        }
     }
     if (rules.empty()) {
         // NEVER claim a workload needs nothing just because we recorded
