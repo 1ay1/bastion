@@ -142,6 +142,14 @@ OTHER
   --json                 machine-readable output
   -h, --help             this message
 
+ENVIRONMENT
+  BASTION_MIN_TIER=t2    operator floor: --yolo and lower --tier are REFUSED,
+                         not silently downgraded. Set it where the agent is
+                         launched; unset locally and nothing changes.
+
+  A ./bastion.toml (or .bastion.toml) in the current directory is used
+  automatically; --policy names one elsewhere.
+
 EXAMPLES
   # Tight, in whatever directory you happen to be in:
   bastion run -- cargo test
@@ -271,6 +279,43 @@ Args parse(int argc, char** argv) {
 // compile would trade a compile-time guarantee for convenience.
 std::optional<Sealed> build_policy(const Args& a, Broker& broker,
                                    std::string& error) {
+    // THE FLOOR. An operator sets BASTION_MIN_TIER; nothing below it runs.
+    //
+    // This is what makes the two audiences compatible. Without it, `--yolo`
+    // is unconditional -- MEASURED: `bastion run --yolo -- cat ~/.ssh/id_*`
+    // prints the private key, and no configuration could forbid it. That is
+    // correct for a developer debugging their own machine and unacceptable for
+    // a shared host or CI runner, and one binary has to serve both.
+    //
+    // Checked HERE, before --yolo is honoured, precisely because --yolo is the
+    // thing being bounded. A floor the bypass can step over is decoration.
+    Tier floor = Tier::Observe;
+    bool has_floor = false;
+    if (const char* mt = std::getenv("BASTION_MIN_TIER"); mt && *mt) {
+        bool ok = false;
+        floor = parse_tier(mt, ok);
+        if (!ok) {
+            error = std::string{"BASTION_MIN_TIER is not a tier: "} + mt +
+                    " (expected t0|t1|t2|t3)";
+            return std::nullopt;
+        }
+        has_floor = true;
+    }
+
+    if (has_floor && a.yolo) {
+        error = "--yolo is refused: BASTION_MIN_TIER=" +
+                std::string{tier_name(floor)} +
+                " requires enforcement.\n"
+                "       Run under the policy instead, or use `bastion observe` "
+                "to find out what the workload needs.";
+        return std::nullopt;
+    }
+    if (has_floor && a.tier < floor) {
+        error = "--tier " + std::string{tier_name(a.tier)} +
+                " is below BASTION_MIN_TIER=" + std::string{tier_name(floor)};
+        return std::nullopt;
+    }
+
     Policy p{a.tier};
 
     if (a.yolo) {
@@ -281,12 +326,40 @@ std::optional<Sealed> build_policy(const Args& a, Broker& broker,
     }
 
     bool from_file = false;
-    if (!a.policy_file.empty()) {
-        auto loaded = load_policy(a.policy_file);
+
+    // POLICY DISCOVERY.
+    //
+    // A committed ./bastion.toml used to be inert: present, readable, and
+    // silently ignored unless the user remembered --policy. MEASURED: a
+    // read-only policy sat beside a workload that happily wrote to the
+    // directory, because the default "workspace = cwd" grant applied instead.
+    // A policy file that does not bind is worse than none -- it looks like
+    // protection.
+    //
+    // So the file is now found the way every other tool finds its config, and
+    // --policy remains available to name one explicitly.
+    std::string policy_path = a.policy_file;
+    if (policy_path.empty()) {
+        std::error_code dec;
+        const auto here = fs::current_path(dec);
+        if (!dec) {
+            for (const char* name : {"bastion.toml", ".bastion.toml"}) {
+                const auto cand = here / name;
+                if (fs::is_regular_file(cand, dec) && !dec) {
+                    policy_path = cand.string();
+                    std::fprintf(stderr, "bastion: using %s\n", name);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!policy_path.empty()) {
+        auto loaded = load_policy(policy_path);
         if (!loaded) {
             // The line number is already folded into the message by
             // ParseError::describe(), so there is no second field to forget.
-            error = a.policy_file + ": " + loaded.error();
+            error = policy_path + ": " + loaded.error();
             return std::nullopt;
         }
         // Only reachable on success, so `pf` is a policy that really parsed --

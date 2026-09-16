@@ -243,6 +243,75 @@ int main() {
         }
     }
 
+    std::puts("\n== 10. a committed policy file BINDS without --policy ==");
+    {
+        // A ./bastion.toml used to be inert -- present, readable, and silently
+        // ignored unless the caller remembered --policy. That is worse than
+        // having no policy, because it LOOKS like protection: a read-only
+        // policy sat beside a workload that happily wrote to the directory.
+        const fs::path proj = "/tmp/bastion-diag-proj";
+        fs::remove_all(proj);
+        fs::create_directories(proj);
+        {
+            std::ofstream f(proj / "bastion.toml");
+            f << "tier = \"t2\"\n\n[[allow]]\nop   = \"fs.read\"\npath = \""
+              << proj.string() << "\"\nwhy  = \"read-only by design\"\n";
+        }
+
+        // Run from INSIDE the project, with no --policy flag at all.
+        const std::string out = "/tmp/bastion-diag-disc.txt";
+        const std::string cmd =
+            "cd " + proj.string() + " && " + BASTION_CLI +
+            " run --no-ledger -- sh -c 'echo x > w.txt' >" + out + " 2>&1";
+        (void)std::system(cmd.c_str());
+
+        std::ifstream rf(out);
+        std::string body((std::istreambuf_iterator<char>(rf)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+
+        check(has(body, "bastion.toml"),
+              "the discovered policy file is named in the output");
+        // The policy grants READ only, so the write must fail. If discovery
+        // silently failed, the default "workspace = cwd" grant would allow it.
+        std::error_code wec;
+        check(!fs::exists(proj / "w.txt", wec),
+              "the discovered policy actually BINDS (write denied)");
+
+        fs::remove_all(proj);
+    }
+
+    std::puts("\n== 11. BASTION_MIN_TIER is a floor --yolo cannot cross ==");
+    {
+        // The mechanism that lets one binary serve both audiences: a developer
+        // who wants no friction, and an operator who must guarantee some.
+        // Without it, --yolo is unconditional and no configuration can forbid
+        // reading ~/.ssh on a shared host.
+        auto run_with_floor = [&](const char* floor, const char* args) {
+            const std::string out = "/tmp/bastion-diag-floor.txt";
+            const std::string cmd = std::string{"BASTION_MIN_TIER="} + floor +
+                                    " " + BASTION_CLI + " run --no-ledger " +
+                                    args + " -w " + ws.string() +
+                                    " -- sh -c 'echo ran' >" + out + " 2>&1";
+            (void)std::system(cmd.c_str());
+            std::ifstream f(out);
+            std::string s((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+            fs::remove(out);
+            return s;
+        };
+
+        check(has(run_with_floor("t2", "--yolo"), "--yolo is refused"),
+              "--yolo is REFUSED below the floor");
+        check(has(run_with_floor("t2", "-t t0"), "below BASTION_MIN_TIER"),
+              "a tier downgrade is refused too");
+        check(has(run_with_floor("t2", "-t t2"), "ran"),
+              "...but running AT the floor still works");
+        // A malformed floor must fail closed, not be ignored.
+        check(!has(run_with_floor("t9", ""), "ran"),
+              "an unparseable BASTION_MIN_TIER fails closed");
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",

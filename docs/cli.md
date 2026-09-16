@@ -312,6 +312,53 @@ Run it first on a new machine.
 
 ---
 
+## Two audiences, one binary
+
+bastion is used by people who want it out of the way and by people who must
+guarantee it is not. Those are not opposite settings of one dial — they are
+**different parties**: the developer choosing convenience, and the operator
+bounding what that choice can reach.
+
+| | You want no friction | You must guarantee confinement |
+|---|---|---|
+| Run it | `bastion run -- <cmd>` — workspace is cwd, nothing to configure | commit a `bastion.toml`; it binds automatically |
+| Stuck | `--yolo` — unrestricted, still fully audited | set `BASTION_MIN_TIER=t2`; `--yolo` is **refused** |
+| Tighten | `bastion observe -- <cmd> && bastion synthesize` | the same loop, reviewed before commit |
+
+### The escape hatch is bounded, not removed
+
+`--yolo` runs unrestricted and keeps the audit ledger, so a frustrated user has
+somewhere to go that is not "switch the sandbox off" — and the run still
+produces the evidence `synthesize` needs. That is deliberate: friction is the
+dominant cause of real-world unconfinement.
+
+But an unconditional bypass is unacceptable on a shared host or CI runner.
+`BASTION_MIN_TIER` sets a floor **the bypass cannot cross**:
+
+```sh
+$ BASTION_MIN_TIER=t2 bastion run --yolo -- ./script.sh
+error: --yolo is refused: BASTION_MIN_TIER=T2:kernel requires enforcement.
+       Run under the policy instead, or use `bastion observe` to find out
+       what the workload needs.
+```
+
+It is checked *before* `--yolo` is honoured, because `--yolo` is the thing being
+bounded — a floor the bypass can step over is decoration. A tier downgrade
+(`-t t0`) is refused the same way, and an unparseable value fails closed rather
+than being ignored.
+
+Set it wherever the agent is launched: a systemd unit, a container env, a CI
+job. The developer's local machine leaves it unset and loses nothing.
+
+### A committed policy binds by itself
+
+`./bastion.toml` (or `.bastion.toml`) is found automatically — `--policy` is for
+naming one elsewhere. This used to require the flag, which meant a policy file
+could sit in a repo looking like protection while every run ignored it. **A
+policy that does not bind is worse than no policy.**
+
+---
+
 ## Tiers
 
 | Tier | Guarantee | Use for |
@@ -369,6 +416,7 @@ tight policy instead of the end of observability.
 | Variable | Effect |
 |---|---|
 | `BASTION_LEDGER` | Default ledger path |
+| `BASTION_MIN_TIER` | Minimum enforced tier. `--yolo` and any lower `--tier` are **refused**, not downgraded. Set by whoever runs the agent (systemd unit, container, CI job); unset locally costs nothing. |
 | `TMPDIR` | Granted read+write (the floor). Private `$TMPDIR` preferred over shared `/tmp`. |
 | `CARGO_HOME`, `GOCACHE`, `GOMODCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`, `CCACHE_DIR`, `ZIG_GLOBAL_CACHE_DIR` | Granted read+write if set, so builds don't re-download on every run |
 
