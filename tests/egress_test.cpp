@@ -89,15 +89,22 @@ int main() {
     check(ok.egress_allowed >= 1, "broker recorded the permitted connection");
 
     // 2. A non-allowlisted host must be refused BY THE BROKER.
-    //    curl reports a refused CONNECT as exit 56 ("CONNECT tunnel failed,
-    //    response 403") and leaves http_code at 000 -- the 403 never becomes a
-    //    response code because the tunnel is never established. Asserting on
-    //    http_code here would fail while enforcement was working correctly.
-    auto no = run("curl -sS -m 10 -o /dev/null https://cloudflare.com 2>&1 "
-                  "| grep -q 'response 403'");
-    check(no.launched() && no.exit_code == 0,
-          "NON-allowlisted host refused by the broker (403 on CONNECT)");
-    check(no.egress_denied >= 1, "broker recorded the refusal");
+    //
+    // Asserted on the BROKER'S OWN COUNTER, not on curl's error text. The
+    // wording is a moving target: curl 8.x says "CONNECT tunnel failed,
+    // response 403", curl 7.81 (ubuntu-22.04) phrases it differently, and
+    // MEASURED, that made the older-ABI CI job report a T3 ENFORCEMENT
+    // FAILURE while enforcement was working perfectly. A security test that
+    // fails on a distro's error-message wording trains you to ignore it.
+    //
+    // egress_denied comes from the broker deciding, so it cannot be faked by
+    // a connection that failed for some unrelated reason -- and curl must
+    // still fail, which is checked alongside it.
+    auto no = run("curl -sS -m 10 -o /dev/null https://cloudflare.com");
+    check(no.launched() && no.exit_code != 0,
+          "NON-allowlisted host: the request FAILS");
+    check(no.egress_denied >= 1,
+          "...and the broker is what refused it (egress_denied recorded)");
     bool named = false;
     for (const auto& [hostport, allowed] : no.egress_attempts) {
         if (hostport.starts_with("cloudflare.com") && !allowed) named = true;

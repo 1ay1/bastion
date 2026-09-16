@@ -295,6 +295,29 @@ EOF
     head -20 /tmp/bastion-oldhdr.log
     fail=1
   fi
+
+  # COMPILING IS NOT ENFORCING.
+  #
+  # The first attempt at old-header support made the file compile by skipping
+  # the network setup when the header lacked the types. It compiled cleanly and
+  # silently stopped mediating egress: on ubuntu-22.04 (5.15 headers, v4-capable
+  # KERNEL) a T2 sandbox with no egress grant reached the internet while doctor
+  # still said "net filtering: yes". A compile check cannot see that.
+  #
+  # So assert the property that actually matters: the network rights must reach
+  # the kernel regardless of what the build header knew. handled_access_net is
+  # set unconditionally, and the net rule loop is not guarded away.
+  guarded=$(awk '/attr.handled_access_net = /{print NR}' "$ROOT/src/backend/landlock.cpp" | head -1)
+  if [ -n "$guarded" ] && \
+     sed -n "$((guarded-3)),$((guarded))p" "$ROOT/src/backend/landlock.cpp" \
+       | grep -qE '^# *if'; then
+    echo "FAIL: handled_access_net is behind a build-header #if"
+    echo "      an old header would then silently disable egress mediation"
+    echo "      on a kernel that supports it -- gate on the RUNTIME probe"
+    fail=1
+  else
+    echo "OK: network rights are not gated on the build header"
+  fi
   rm -rf "$OLD"
 fi
 

@@ -39,14 +39,21 @@
 //   SHAPES -- the NETWORK support (v4) is not just constants. It needs
 //     `landlock_ruleset_attr::handled_access_net`, `struct
 //     landlock_net_port_attr` and the LANDLOCK_RULE_NET_PORT enumerator, none
-//     of which can be conjured with #define. The net code is therefore guarded
-//     by `#if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)` as a proxy for "this
-//     header knows about networking at all".
+//     of which can be conjured with #define.
 //
-// So the net constants are deliberately NOT defined here. Defining them would
-// flip that guard to true against a v1 header and break the build in a new
-// place -- the fix causing the failure it was meant to prevent. T3 egress
-// filtering is refused at runtime on such kernels anyway.
+// The first attempt at this used LANDLOCK_ACCESS_NET_CONNECT_TCP as a proxy
+// for "this header knows about networking", and so refused to define the net
+// constants. That traded a compile error for a SILENT ENFORCEMENT HOLE, which
+// is far worse: on ubuntu-22.04 the build headers are 5.15 (pre-Landlock-net)
+// while the RUNNING kernel is v4-capable, so has_net_tcp was true, the mask
+// fell into the #else and returned 0, and the ruleset handled no network
+// rights at all -- egress was UNRESTRICTED while bastion reported T2 with net
+// filtering. MEASURED: live_enforcement's "egress DENIED without grant"
+// failed on that runner and passed everywhere else.
+//
+// So values and shapes get SEPARATE detection. The constants are always
+// defined; BASTION_LANDLOCK_NET_UAPI records whether the header had the
+// struct machinery, and only the code that needs those types is guarded on it.
 #    ifndef LANDLOCK_ACCESS_FS_REFER
 #      define LANDLOCK_ACCESS_FS_REFER (1ULL << 13)
 #    endif
@@ -55,6 +62,53 @@
 #    endif
 #    ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
 #      define LANDLOCK_ACCESS_FS_IOCTL_DEV (1ULL << 15)
+#    endif
+
+// Does the HEADER carry the v4 networking types? Decided before any of the
+// constants below are defined, because defining them would destroy the
+// evidence -- that is precisely the mistake described above.
+#    if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+#      define BASTION_LANDLOCK_NET_UAPI 1
+#    endif
+
+#    ifndef LANDLOCK_ACCESS_NET_BIND_TCP
+#      define LANDLOCK_ACCESS_NET_BIND_TCP (1ULL << 0)
+#    endif
+#    ifndef LANDLOCK_ACCESS_NET_CONNECT_TCP
+#      define LANDLOCK_ACCESS_NET_CONNECT_TCP (1ULL << 1)
+#    endif
+
+#    if !defined(BASTION_LANDLOCK_NET_UAPI)
+// The header predates Landlock networking, but the RUNNING KERNEL may not:
+// ubuntu-22.04 ships 5.15 headers on a v4-capable kernel. Skipping the network
+// setup there does not "degrade gracefully", it silently stops mediating
+// egress while doctor still reports "net filtering: yes" -- MEASURED, a
+// T2 sandbox with no egress grant reached the internet.
+//
+// So declare the v4 UAPI ourselves. These are ABI-stable kernel definitions
+// transcribed from include/uapi/linux/landlock.h; the runtime probe still
+// decides whether the kernel actually supports them.
+//
+// The ruleset attr is REDECLARED under our own name rather than extended,
+// because the header's struct is a fixed size and the kernel is told which
+// size we are passing (see ruleset_attr_size).
+struct bastion_landlock_ruleset_attr {
+    __u64 handled_access_fs;
+    __u64 handled_access_net;
+};
+#      define landlock_ruleset_attr bastion_landlock_ruleset_attr
+
+struct landlock_net_port_attr {
+    __u64 allowed_access;
+    __u64 port;
+};
+// The real kernel defines this as an ENUMERATOR of landlock_rule_type, and
+// C++ cannot add one to an existing enum. So name the value here and let the
+// single call site cast -- see the ll_add_rule() call for net rules.
+#      define BASTION_LANDLOCK_RULE_NET_PORT 2
+#    else
+// Header has the real enum; use it.
+#      define BASTION_LANDLOCK_RULE_NET_PORT LANDLOCK_RULE_NET_PORT
 #    endif
 #  endif
 #endif
@@ -141,15 +195,11 @@ std::uint64_t fs_mask_for(const AbiInfo& abi) {
 
 std::uint64_t net_mask_for(const AbiInfo& abi) {
     if (!abi.has_net_tcp) return 0;
-#if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+    // Unconditional: the constants are defined above whether or not the build
+    // header had them, and has_net_tcp is a RUNTIME probe of the running
+    // kernel. Gating this on the header is what created the enforcement hole
+    // described at the top of this file.
     return LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
-#else
-    // Built against a pre-v4 header that has no network rights at all. The
-    // runtime probe cannot report has_net_tcp on such a kernel, but the
-    // COMPILER still has to see a valid expression -- so this branch exists
-    // for the build, not for execution. T3 is refused, not degraded.
-    return 0;
-#endif
 }
 
 std::uint16_t parse_port(std::string_view host_port) {
@@ -655,9 +705,11 @@ bool apply_compiled(ForkChild tok, const Ruleset& rs, const AbiCore& abi,
 
     struct landlock_ruleset_attr attr {};
     attr.handled_access_fs = rs.handled_fs;
-#  if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+    // Unconditional. The v4 types are declared at the top of this file when the
+    // build header predates them, so there is no longer a build in which this
+    // field is skipped -- skipping it is what let egress escape unmediated on
+    // ubuntu-22.04. rs.handled_net is 0 unless the RUNTIME probe found support.
     attr.handled_access_net = rs.handled_net;
-#  endif
 
     // Pass the ABI-appropriate size, not sizeof() (see ruleset_attr_size).
     const int fd = ll_create_ruleset(&attr, abi.ruleset_attr_size(), 0);
@@ -718,7 +770,9 @@ bool apply_compiled(ForkChild tok, const Ruleset& rs, const AbiCore& abi,
     // broker port was never added -- so T3 "worked" (nothing got out) while
     // being totally unusable (the workload could not reach the broker either).
     // Availability failure masquerading as enforcement.
-#  if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+    // Unconditional, for the same reason as handled_access_net above: the
+    // types exist in every build now, and rs.ports is empty unless the runtime
+    // probe found network support.
     for (const auto& pr : rs.ports) {
         if (rs.handled_net == 0) break;
         struct landlock_net_port_attr np {};
@@ -728,13 +782,18 @@ bool apply_compiled(ForkChild tok, const Ruleset& rs, const AbiCore& abi,
         if (pr.bind) np.allowed_access |= LANDLOCK_ACCESS_NET_BIND_TCP;
         np.allowed_access &= rs.handled_net;
         if (np.allowed_access == 0) continue;
-        if (ll_add_rule(fd, LANDLOCK_RULE_NET_PORT, &np, 0) != 0) {
+        // Cast because on a pre-v4 header we supply the value ourselves and
+        // C++ cannot extend the kernel's enum. On a modern header this is the
+        // real enumerator and the cast is a no-op.
+        if (ll_add_rule(fd,
+                        static_cast<enum landlock_rule_type>(
+                            BASTION_LANDLOCK_RULE_NET_PORT),
+                        &np, 0) != 0) {
             ::close(fd);
             setf("landlock_add_rule(net) failed");
             return false;
         }
     }
-#  endif
 
     if (ll_restrict_self(fd, 0) != 0) {
         ::close(fd);
