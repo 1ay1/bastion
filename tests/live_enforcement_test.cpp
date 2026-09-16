@@ -107,8 +107,15 @@ int main() {
 #if defined(__APPLE__)
     auto compiled_net = darwin::compile(net);
     bool warned = false;
-    for (const auto& w : compiled_net.warnings) {
-        if (w.find("cannot restrict by hostname") != std::string::npos) warned = true;
+    // compile() returns Result<CompileResult>; warnings live on the VALUE.
+    // This test drifted when that migration happened and nothing on Linux
+    // compiles it, so only macOS CI ever saw the breakage.
+    if (compiled_net.ok()) {
+        for (const auto& w : compiled_net.value().warnings) {
+            if (w.find("cannot restrict by hostname") != std::string::npos) {
+                warned = true;
+            }
+        }
     }
     check(warned, "warns that Seatbelt cannot filter by hostname");
 #else
@@ -142,13 +149,13 @@ int main() {
     std::string bad = std::string{"/tmp/ba"} + '\n' + "d";
     auto badpol = Policy{Tier::Kernel}.allow(Right::FsRead, bad, "injection").seal();
     auto bc = darwin::compile(badpol);
-    check(!bc.ok, "control-character path REJECTED at compile time");
+    check(!bc.ok(), "control-character path REJECTED at compile time");
 
     // The injection payload measured in tools/probe must not escalate.
     std::string inj = "/tmp/bastion-live\") (allow file-read* (subpath \"/";
     auto injpol = Policy{Tier::Kernel}.allow(Right::FsRead, inj, "injection").seal();
     auto ic = darwin::compile(injpol);
-    if (ic.ok) {
+    if (ic.ok()) {
         SpawnRequest req;
         req.argv = {"/bin/sh", "-c", "cat /etc/passwd 2>/dev/null"};
         auto ir = spawn(injpol, req);

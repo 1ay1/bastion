@@ -347,6 +347,23 @@ if [ "$(uname -s)" = "Linux" ]; then
       fail=1
     fi
   done
+
+  # Files whose __APPLE__ branch is pure C++ against OUR OWN headers can be
+  # typechecked directly with -D__APPLE__ -- no Darwin SDK needed, because
+  # they touch bastion types rather than Seatbelt. MEASURED: the Result<T>
+  # migration rotted live_enforcement_test's Apple block (`bc.ok` vs `bc.ok()`,
+  # `.warnings` moving onto `.value()`) and it reached CI twice, because
+  # -U__linux__ alone never reaches those lines. This does.
+  for f in "$ROOT/tests/live_enforcement_test.cpp"; do
+    [ -f "$f" ] || continue
+    if ! c++ -std=$STD -D__APPLE__ -I"$ROOT/include" -fsyntax-only "$f" \
+         2>/tmp/bastion-apple.log; then
+      echo "FAIL: $(basename "$f") does not typecheck with __APPLE__ defined"
+      head -12 /tmp/bastion-apple.log
+      ok=0
+      fail=1
+    fi
+  done
   [ "$ok" -eq 1 ] && echo "OK: the non-Linux branch still compiles"
 fi
 
