@@ -177,6 +177,43 @@ Tier parse_tier(std::string_view s, bool& ok) {
     return Tier::Kernel;
 }
 
+// The operator floor, read once and applied everywhere a workload can run.
+//
+// Returns false and fills `error` if `requested` is below it. Shared rather
+// than inlined into build_policy(), because MEASURED: `observe` did not
+// consult it, and `observe` runs the workload UNCONFINED by design -- so
+// `BASTION_MIN_TIER=t2 bastion observe -- cat ~/.ssh/id_*` printed the key
+// while `bastion run --yolo` was correctly refused. A floor with one
+// unguarded entrance is not a floor.
+bool floor_permits(Tier requested, bool is_yolo, std::string& error) {
+    const char* mt = std::getenv("BASTION_MIN_TIER");
+    if (!mt || !*mt) return true;
+
+    bool ok = false;
+    const Tier floor = parse_tier(mt, ok);
+    if (!ok) {
+        error = std::string{"BASTION_MIN_TIER is not a tier: "} + mt +
+                " (expected t0|t1|t2|t3)";
+        return false;
+    }
+
+    if (is_yolo) {
+        error = "--yolo is refused: BASTION_MIN_TIER=" +
+                std::string{tier_name(floor)} +
+                " requires enforcement.\n"
+                "       Run under the policy instead, or use `bastion observe` "
+                "to find out what the workload needs.";
+        return false;
+    }
+    if (requested < floor) {
+        error = std::string{tier_name(requested)} +
+                " is below BASTION_MIN_TIER=" + std::string{tier_name(floor)};
+        return false;
+    }
+    return true;
+}
+
+
 struct Args {
     std::string cmd;
     std::vector<std::string> workspace;
@@ -279,42 +316,11 @@ Args parse(int argc, char** argv) {
 // compile would trade a compile-time guarantee for convenience.
 std::optional<Sealed> build_policy(const Args& a, Broker& broker,
                                    std::string& error) {
-    // THE FLOOR. An operator sets BASTION_MIN_TIER; nothing below it runs.
-    //
-    // This is what makes the two audiences compatible. Without it, `--yolo`
-    // is unconditional -- MEASURED: `bastion run --yolo -- cat ~/.ssh/id_*`
-    // prints the private key, and no configuration could forbid it. That is
-    // correct for a developer debugging their own machine and unacceptable for
-    // a shared host or CI runner, and one binary has to serve both.
-    //
-    // Checked HERE, before --yolo is honoured, precisely because --yolo is the
-    // thing being bounded. A floor the bypass can step over is decoration.
-    Tier floor = Tier::Observe;
-    bool has_floor = false;
-    if (const char* mt = std::getenv("BASTION_MIN_TIER"); mt && *mt) {
-        bool ok = false;
-        floor = parse_tier(mt, ok);
-        if (!ok) {
-            error = std::string{"BASTION_MIN_TIER is not a tier: "} + mt +
-                    " (expected t0|t1|t2|t3)";
-            return std::nullopt;
-        }
-        has_floor = true;
-    }
-
-    if (has_floor && a.yolo) {
-        error = "--yolo is refused: BASTION_MIN_TIER=" +
-                std::string{tier_name(floor)} +
-                " requires enforcement.\n"
-                "       Run under the policy instead, or use `bastion observe` "
-                "to find out what the workload needs.";
-        return std::nullopt;
-    }
-    if (has_floor && a.tier < floor) {
-        error = "--tier " + std::string{tier_name(a.tier)} +
-                " is below BASTION_MIN_TIER=" + std::string{tier_name(floor)};
-        return std::nullopt;
-    }
+    // The operator floor. Checked BEFORE --yolo is honoured, precisely because
+    // --yolo is the thing being bounded: a floor the bypass can step over is
+    // decoration. Shared with cmd_observe(), which needs the same guard for a
+    // stronger reason -- it runs the workload unconfined by design.
+    if (!floor_permits(a.tier, a.yolo, error)) return std::nullopt;
 
     Policy p{a.tier};
 
@@ -837,6 +843,30 @@ int cmd_run(const Args& a) {
 int cmd_observe(const Args& a) {
     if (a.argv.empty()) {
         std::fputs("error: no command given (use `--` before it)\n", stderr);
+        return 2;
+    }
+
+    // THE FLOOR APPLIES HERE TOO, and this is the entrance that matters most.
+    //
+    // `observe` runs the workload UNCONFINED -- that is what T0 IS, and it is
+    // the whole reason the mode exists. So it is a strictly more powerful
+    // bypass than --yolo: MEASURED, `BASTION_MIN_TIER=t2 bastion observe --
+    // cat ~/.ssh/id_*` printed the private key while the same command under
+    // `run --yolo` was correctly refused.
+    //
+    // An operator who sets a floor above T0 is saying "nothing unconfined runs
+    // here", and observation is unconfined. The refusal names the tradeoff
+    // rather than just denying, because observing IS how you build a policy --
+    // the answer is to do it somewhere the floor permits it.
+    std::string ferr;
+    if (!floor_permits(Tier::Observe, /*is_yolo=*/false, ferr)) {
+        std::fprintf(stderr,
+            "error: `observe` runs the workload UNCONFINED, and %s\n"
+            "       Observation is how a policy is discovered, so do it on a "
+            "machine without a floor\n"
+            "       (or with BASTION_MIN_TIER=t0), review the result, and "
+            "commit it as bastion.toml.\n",
+            ferr.c_str());
         return 2;
     }
     auto caps = observe_probe();

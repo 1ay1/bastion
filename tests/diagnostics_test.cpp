@@ -312,6 +312,45 @@ int main() {
               "an unparseable BASTION_MIN_TIER fails closed");
     }
 
+    std::puts("\n== 12. `observe` cannot be used to bypass the floor ==");
+    {
+        // The hole in the first version of BASTION_MIN_TIER. `observe` runs
+        // the workload UNCONFINED by design -- that is what T0 IS -- so it was
+        // a strictly MORE powerful bypass than --yolo, which the floor had
+        // just been added to block. MEASURED: with the floor set,
+        // `bastion observe -- cat ~/.ssh/id_*` printed the private key while
+        // `run --yolo` was correctly refused.
+        auto observe_with = [&](const char* floor) {
+            const std::string out = "/tmp/bastion-diag-obs.txt";
+            std::string cmd;
+            if (floor) cmd += std::string{"BASTION_MIN_TIER="} + floor + " ";
+            cmd += std::string{BASTION_CLI} +
+                   " observe --no-ledger -- sh -c 'echo observed' >" + out +
+                   " 2>&1";
+            (void)std::system(cmd.c_str());
+            std::ifstream f(out);
+            std::string s((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+            fs::remove(out);
+            return s;
+        };
+
+        check(has(observe_with("t2"), "UNCONFINED"),
+              "observe is REFUSED under a floor above T0");
+        check(!has(observe_with("t2"), "observed"),
+              "...and the workload really does not run");
+        // The refusal must stay actionable: observation is HOW a policy is
+        // discovered, so a bare denial would be a dead end.
+        check(has(observe_with("t2"), "bastion.toml"),
+              "...and the message says how to proceed");
+
+        // An operator who sets t0 has explicitly allowed unconfined runs.
+        check(has(observe_with("t0"), "observed"),
+              "BASTION_MIN_TIER=t0 permits observation");
+        check(has(observe_with(nullptr), "observed"),
+              "no floor set leaves observe untouched");
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",

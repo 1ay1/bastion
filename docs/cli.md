@@ -347,8 +347,20 @@ bounded — a floor the bypass can step over is decoration. A tier downgrade
 (`-t t0`) is refused the same way, and an unparseable value fails closed rather
 than being ignored.
 
+**`bastion observe` is bounded by it too**, and that is the entrance that
+matters most: observation runs the workload *unconfined* — that is what T0 is —
+so it is a strictly more powerful bypass than `--yolo`. The refusal stays
+actionable, because observing is how a policy gets discovered in the first
+place: do it on a machine without a floor (or with `BASTION_MIN_TIER=t0`),
+review the result, and commit it.
+
 Set it wherever the agent is launched: a systemd unit, a container env, a CI
 job. The developer's local machine leaves it unset and loses nothing.
+
+> This is an **operator** control, not a defence against a hostile local user.
+> Anyone who can unset the variable can also invoke the binary directly. It is
+> the right shape for CI runners and managed agent hosts; a genuinely
+> adversarial local user needs the launcher itself locked down.
 
 ### A committed policy binds by itself
 
