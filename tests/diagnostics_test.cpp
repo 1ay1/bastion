@@ -351,6 +351,79 @@ int main() {
               "no floor set leaves observe untouched");
     }
 
+    std::puts("\n== 13. tools outside /usr are found and runnable ==");
+    {
+        // REPORTED against a sibling project: a Go toolchain installed by
+        // webinstall.dev lives in ~/.local/opt and links into ~/.local/bin, so
+        // `gofmt` failed inside the sandbox with "binary missing or not
+        // executable" while working fine outside. The same bug reproduced here.
+        //
+        // The fix is to inherit the user's OWN $PATH rather than hardcode a
+        // list -- pipx, cargo/go install, bun, deno, and the mise/asdf/pyenv
+        // shim directories all use prefixes nobody can enumerate in advance,
+        // so a fixed list is never finished and every gap is this bug again.
+        //
+        // Both halves must work: the command has to RESOLVE, and it then has
+        // to RUN. Granting one without the other produces "not executable"
+        // about a file that plainly exists.
+        const fs::path bindir = ws / "toolbin";
+        fs::create_directories(bindir);
+        const fs::path tool = bindir / "bastion-fake-tool";
+        {
+            std::ofstream f(tool);
+            f << "#!/bin/sh\necho tool-ran\n";
+        }
+        fs::permissions(tool, fs::perms::owner_all | fs::perms::group_exec |
+                                  fs::perms::others_exec);
+
+        const std::string out = "/tmp/bastion-diag-path.txt";
+        const std::string cmd = "PATH=" + bindir.string() + ":$PATH " +
+                                BASTION_CLI + " run --no-ledger -w " +
+                                ws.string() + " -- bastion-fake-tool >" + out +
+                                " 2>&1";
+        (void)std::system(cmd.c_str());
+
+        std::ifstream f(out);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+
+        check(has(body, "tool-ran"),
+              "a tool on the user's PATH but outside /usr runs");
+        check(!has(body, "binary missing"),
+              "...and is not reported as missing");
+    }
+
+    std::puts("\n== 14. a PATH entry is an exec grant, so it is vetted ==");
+    {
+        // Every directory inherited from $PATH becomes a read+exec grant, so
+        // it has to be treated as one. Three classes must never survive:
+        //
+        //   relative (".")  -- resolves against the WORKLOAD's cwd, so a
+        //                      hostile repo could ship a `git` that runs on
+        //                      checkout
+        //   world-writable -- any local process can plant a binary there
+        //   missing        -- a typo must not become a grant for a directory
+        //                     someone creates later
+        const std::string out = "/tmp/bastion-diag-vet.txt";
+        const std::string cmd =
+            "PATH=/tmp:.:/nonexistent:/usr/bin " + std::string{BASTION_CLI} +
+            " explain -w " + ws.string() + " >" + out + " 2>&1";
+        (void)std::system(cmd.c_str());
+
+        std::ifstream f(out);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+
+        // /tmp is world-writable and not ours; "." is relative; /nonexistent
+        // does not exist. None may appear as a granted rule.
+        check(!has(body, "\n  rx /tmp\n") && !has(body, "  r  /tmp\n"),
+              "world-writable /tmp is not granted from PATH");
+        check(!has(body, "/nonexistent"),
+              "a missing PATH entry is not granted");
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",

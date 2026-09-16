@@ -167,4 +167,18 @@ void spawn_wait(SpawnResult& result);
 // Secrets in the ambient environment are dropped unless explicitly passed.
 [[nodiscard]] std::vector<std::string> sanitized_env(const Sealed& policy);
 
+// The directories the child's PATH will contain, vetted for safety.
+//
+// Derived from the user's own $PATH rather than a hardcoded list, because
+// toolchains no longer live in /usr: webinstall.dev, pipx, cargo/go install,
+// and the mise/asdf/pyenv shim directories all use per-user prefixes that
+// cannot be enumerated in advance. Entries that are relative, missing, or
+// world-writable-and-not-ours are dropped -- a PATH entry is an EXEC grant,
+// so it has to be vetted like one.
+//
+// The backend grants read+exec on these, so a command that RESOLVES here can
+// also RUN. Exposed for that reason: resolution and enforcement must agree, or
+// the sandbox finds a binary it then refuses to execute.
+[[nodiscard]] const std::vector<std::string>& sandbox_path_dirs();
+
 }  // namespace bastion

@@ -2,6 +2,7 @@
 
 #if defined(__linux__)
 #  include "bastion/backend/namespaces.hpp"
+#  include "bastion/spawn.hpp"
 
 #  include <fcntl.h>
 #  include <sys/prctl.h>
@@ -265,6 +266,21 @@ Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
         std::error_code ec;
         if (!std::filesystem::exists(p, ec) || ec) continue;  // distro variance
         rs.paths.push_back({p, kReadRights | kExecRights});
+    }
+
+    // THE USER'S TOOL DIRECTORIES. Read+exec on every directory that survived
+    // vetting in sandbox_path_dirs().
+    //
+    // Without this the sandbox can RESOLVE a command it then cannot RUN, which
+    // is the worst of both worlds: the error says "binary missing or not
+    // executable" about a file that plainly exists. REPORTED against a sibling
+    // project -- a Go toolchain installed under ~/.local was invisible inside
+    // the sandbox while working fine outside it.
+    //
+    // Read as well as exec: a dynamically-linked binary needs its own file
+    // readable, and interpreters read the script they are handed.
+    for (const auto& dir : sandbox_path_dirs()) {
+        rs.paths.push_back({dir, kReadRights | kExecRights});
     }
 
     // VERSION CONTROL CONFIG. READ-ONLY, and under $HOME so it cannot be

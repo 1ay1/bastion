@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <memory>
 
 #if defined(__APPLE__)
@@ -190,10 +191,104 @@ void close_inherited_fds(int keep = -1) {
     }
 }
 
-// The PATH the child will actually see. Declared here because argv[0] is
-// resolved against THIS, not against bastion's own PATH -- see resolve_argv0.
-constexpr std::string_view kSandboxPath =
+// System directories, always present so a sandbox works even with no $PATH.
+constexpr std::string_view kSystemPath =
     "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin";
+
+// The PATH the child will see, and the directories the floor grants exec on.
+//
+// THE PROBLEM. Toolchains do not live in /usr any more. webinstall.dev puts Go
+// in ~/.local/opt and links it into ~/.local/bin; pipx, `go install`, `cargo
+// install`, bun, deno all use their own prefixes; mise/asdf/pyenv/rbenv use
+// per-user SHIM directories whose paths nobody can guess. REPORTED against a
+// sibling project and reproduced here: `gofmt` failed with "binary missing or
+// not executable" inside the sandbox while sitting plainly on the user's PATH
+// outside.
+//
+// THE WRONG FIX is a hardcoded list of ~/.local/bin, ~/.cargo/bin, ~/go/bin,
+// ~/.bun/bin, ~/.asdf/shims ... That list is never finished, and every entry
+// it lacks is the same bug reported again by a different user.
+//
+// THE FIX: inherit the user's OWN $PATH, which is the authoritative statement
+// of where their tools are -- they already maintain it, for exactly this
+// purpose. Filtered, because a sandbox may not simply trust an inherited
+// environment variable:
+//
+//   - relative entries are dropped. A "." or "build/bin" on PATH resolves
+//     against the WORKLOAD's cwd, so a hostile repo could ship a `git` that
+//     runs on checkout. Absolute paths only.
+//   - world-writable directories are dropped unless owned by this user. A
+//     stale /tmp/mybin on someone's PATH is a place any local process can
+//     plant a binary that the sandbox would then execute.
+//   - non-existent entries are dropped, so a typo'd PATH does not turn into a
+//     grant for a directory someone can later create.
+//
+// Order is preserved, so which tool a name resolves to is the same inside the
+// sandbox as outside -- a sandbox that silently ran a DIFFERENT `python` than
+// the shell would be worse than one that ran none.
+}  // namespace
+
+const std::vector<std::string>& sandbox_path_dirs() {
+    static const std::vector<std::string> dirs = [] {
+        std::vector<std::string> out;
+        std::set<std::string> seen;
+        const uid_t me = ::getuid();
+
+        const auto consider = [&](std::string_view d) {
+            if (d.empty() || d.front() != '/') return;  // relative: unsafe
+            std::error_code ec;
+            const std::string s{d};
+            if (!std::filesystem::is_directory(s, ec) || ec) return;
+
+            // Reject anything world-writable that we do not own: another
+            // local user could drop a binary in it.
+            struct ::stat st {};
+            if (::stat(s.c_str(), &st) != 0) return;
+            if ((st.st_mode & S_IWOTH) && st.st_uid != me) return;
+
+            if (seen.insert(s).second) out.push_back(s);
+        };
+
+        // The user's PATH first, in their order.
+        if (const char* p = std::getenv("PATH"); p && *p) {
+            std::string_view rest{p};
+            while (!rest.empty()) {
+                const auto colon = rest.find(':');
+                consider(rest.substr(0, colon));
+                if (colon == std::string_view::npos) break;
+                rest = rest.substr(colon + 1);
+            }
+        }
+        // Then the system defaults, so a cleared or minimal PATH still yields
+        // a working sandbox rather than one that cannot find /bin/sh.
+        {
+            std::string_view rest = kSystemPath;
+            while (!rest.empty()) {
+                const auto colon = rest.find(':');
+                consider(rest.substr(0, colon));
+                if (colon == std::string_view::npos) break;
+                rest = rest.substr(colon + 1);
+            }
+        }
+        return out;
+    }();
+    return dirs;
+}
+
+namespace {
+
+// The same set as a PATH string for the child's environment.
+const std::string& sandbox_path() {
+    static const std::string p = [] {
+        std::string s;
+        for (const auto& d : sandbox_path_dirs()) {
+            if (!s.empty()) s += ':';
+            s += d;
+        }
+        return s;
+    }();
+    return p;
+}
 
 // Resolve a bare command name to an absolute path, the way a shell would.
 //
@@ -202,10 +297,10 @@ constexpr std::string_view kSandboxPath =
 // grant read on every PATH entry, and the child may not allocate anyway. So the
 // lookup happens HERE, in the parent, before the policy is compiled.
 //
-// It searches the PATH the CHILD will get (kSandboxPath), not bastion's own.
-// Resolving against the parent's PATH would find binaries in directories like
-// ~/.local/bin that the sandbox cannot execute, turning a clear "not found"
-// into a confusing mid-run denial.
+// It searches the same directories the CHILD will get (sandbox_path_dirs()),
+// not bastion's own raw PATH. Resolving against an unvetted PATH would find
+// binaries in directories the sandbox does not grant exec on, turning a clear
+// "not found" into a confusing mid-run denial.
 //
 // MEASURED: without this, `bastion run -- cc main.c` failed with "exec failed
 // (binary missing or not executable)" while `bastion observe -- cc main.c`
@@ -216,15 +311,8 @@ std::string resolve_argv0(const std::string& cmd) {
     // exactly as execve() would treat it.
     if (cmd.find('/') != std::string::npos) return cmd;
 
-    std::string_view rest = kSandboxPath;
-    while (!rest.empty()) {
-        const auto colon = rest.find(':');
-        const std::string_view dir = rest.substr(0, colon);
-        rest = colon == std::string_view::npos ? std::string_view{}
-                                               : rest.substr(colon + 1);
-        if (dir.empty()) continue;
-
-        std::string candidate{dir};
+    for (const auto& dir : sandbox_path_dirs()) {
+        std::string candidate = dir;
         candidate += '/';
         candidate += cmd;
 
@@ -251,7 +339,7 @@ std::vector<std::string> sanitized_env(const Sealed& policy) {
     std::vector<std::string> env;
 
     // A coherent PATH whose entries are readable under the base profile.
-    env.emplace_back(std::string{"PATH="} + std::string{kSandboxPath});
+    env.emplace_back("PATH=" + sandbox_path());
     env.emplace_back(std::string{"HOME="} + getenv_or("HOME", "/tmp"));
     env.emplace_back(std::string{"USER="} + getenv_or("USER", "agent"));
     env.emplace_back(std::string{"SHELL="} + getenv_or("SHELL", "/bin/sh"));
