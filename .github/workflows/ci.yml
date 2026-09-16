@@ -22,7 +22,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   linux:
-    name: Linux (Landlock) — UNVERIFIED backend
+    name: Linux (Landlock + seccomp + namespaces)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -31,19 +31,56 @@ jobs:
         run: |
           uname -r
           cat /sys/kernel/security/lsm 2>/dev/null || echo "securityfs not mounted"
+          cat /proc/sys/kernel/seccomp/actions_avail 2>/dev/null || true
+          echo "userns max: $(cat /proc/sys/user/max_user_namespaces 2>/dev/null)"
           dmesg 2>/dev/null | grep -i landlock || echo "(no landlock dmesg line)"
       - name: Install headers
         run: sudo apt-get update && sudo apt-get install -y linux-libc-dev
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
       - name: Build
-        run: cmake --build build -j
+        # Warnings are errors here. The two bugs that cost the most during
+        # bring-up were a missing include and a dead preprocessor branch --
+        # both things a compiler will tell you about if you let it.
+        run: cmake --build build -j -- CXXFLAGS="-Werror"
       - name: Doctor
         run: ./build/bastion doctor
       - name: Test
-        # This backend has never run on real hardware. Failures here are
-        # EXPECTED until someone works through docs/linux-bringup.md §6 --
-        # they are the point of this job, not a regression.
+        # NOT continue-on-error. The backend is verified on real hardware
+        # (kernel 7.2.2 / ABI v10, docs/linux-bringup.md), so a failure here is
+        # a REGRESSION, not an expected gap. Leaving this job advisory would
+        # mean the whole Linux backend could rot silently.
+        run: ctest --test-dir build --output-on-failure
+
+  linux-old-abi:
+    name: Linux (older Landlock ABI — graceful degradation)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel + ABI
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || echo "securityfs not mounted"
+      - name: Install headers
+        run: sudo apt-get update && sudo apt-get install -y linux-libc-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build -j
+      - name: Doctor reports the real ABI, whatever it is
+        run: ./build/bastion doctor
+      - name: Test
+        # THE POINT OF THIS JOB. Development happens on a current kernel
+        # (ABI v10), where every capability is present -- so the version-gating
+        # code is never exercised there. This runner is deliberately older, and
+        # is the only place the "built on a new kernel, must still confine on an
+        # old one" path gets tested: attr-size clamping, T3 refusing below ABI
+        # v4 instead of silently degrading, and the ergonomic floor coping with
+        # a different distro layout.
+        #
+        # Advisory for now: this configuration has not been characterised yet,
+        # so a failure is information, not a known regression. Flip this to
+        # blocking once docs/linux-bringup.md §6.3 has been worked through.
         continue-on-error: true
         run: ctest --test-dir build --output-on-failure
 

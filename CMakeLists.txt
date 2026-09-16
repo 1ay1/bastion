@@ -13,9 +13,15 @@ option(BASTION_BUILD_TESTS "Build tests" ON)
 # where the headers exist.
 # -----------------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    include(CheckIncludeFile)
-    check_include_file("linux/landlock.h" BASTION_HAVE_LANDLOCK_H)
-    check_include_file("linux/seccomp.h" BASTION_HAVE_SECCOMP_H)
+    # CheckIncludeFileCXX, not CheckIncludeFile: the latter compiles a .c probe
+    # and this project only enables CXX, so it fails with "Unknown extension
+    # .c ... try_compile() works only for enabled languages" and ABORTS the
+    # configure. It went unnoticed because an already-configured build tree
+    # caches the result and never re-runs the check -- only a FRESH clone hit
+    # it, which is exactly what CI does.
+    include(CheckIncludeFileCXX)
+    check_include_file_cxx("linux/landlock.h" BASTION_HAVE_LANDLOCK_H)
+    check_include_file_cxx("linux/seccomp.h" BASTION_HAVE_SECCOMP_H)
     set(BASTION_PLATFORM "linux")
 elseif(APPLE)
     set(BASTION_PLATFORM "darwin")
@@ -89,6 +95,13 @@ if(BASTION_BUILD_TESTS)
     add_executable(adversarial_test tests/adversarial_test.cpp)
     target_link_libraries(adversarial_test PRIVATE bastion)
     add_test(NAME adversarial COMMAND adversarial_test)
+
+    # Resource ceilings: fork-bomb / disk-fill backstops, and the guarantee
+    # that they stay OUT OF THE WAY when not asked for.
+    add_executable(rlimit_test tests/rlimit_test.cpp)
+    target_link_libraries(rlimit_test PRIVATE bastion)
+    add_test(NAME rlimit COMMAND rlimit_test)
+    set_tests_properties(rlimit PROPERTIES TIMEOUT 120)
 
     # T0 observation: the mechanism `synthesize` depends on. Asserts that
     # observing does not change the workload, that grandchildren are seen, and

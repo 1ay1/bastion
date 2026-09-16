@@ -76,6 +76,16 @@ POLICY OPTIONS
                          stays fully active, so `bastion synthesize` can turn
                          the run into a least-privilege policy afterwards.
 
+RESOURCE LIMITS (opt-in; setrlimit, inherited by the whole subtree)
+  --max-procs N          cap processes/threads (fork-bomb ceiling)
+  --max-file-mb N        cap the size of any file the child creates
+  --max-cpu-sec N        cap CPU seconds (runaway loops die with SIGXCPU)
+
+  Off by default and deliberately so: a ceiling that fires during a legitimate
+  build is exactly the friction that gets sandboxes turned off, and the right
+  number is workload-specific. Core dumps are always disabled, since a crashing
+  confined process should not write memory images into the workspace.
+
 OTHER
   --ledger PATH          audit log location (default ~/.bastion/ledger.jsonl)
   --no-ledger            do not write an audit log
@@ -121,6 +131,7 @@ struct Args {
     bool json = false;
     bool no_ledger = false;
     std::string ledger = default_ledger_path();
+    ResourceLimits limits;
     std::vector<std::string> argv;
     std::string error;
 };
@@ -155,6 +166,29 @@ Args parse(int argc, char** argv) {
         else if (s == "--no-ledger")           a.no_ledger = true;
         else if (s == "--json")                a.json = true;
         else if (s == "--yolo")                a.yolo = true;
+        else if (s == "--max-procs" || s == "--max-file-mb" ||
+                 s == "--max-cpu-sec") {
+            const std::string flag{s};
+            const std::string_view raw = next(flag.c_str());
+            if (!a.error.empty()) return a;
+            // Parse strictly: a typo'd ceiling that silently becomes 0 would
+            // disable the very limit the user asked for.
+            unsigned long long v = 0;
+            const auto* b = raw.data();
+            const auto* e = raw.data() + raw.size();
+            auto [ptr, ec] = std::from_chars(b, e, v);
+            if (ec != std::errc{} || ptr != e || v == 0) {
+                a.error = flag + " needs a positive integer";
+                return a;
+            }
+            if (flag == "--max-procs") {
+                a.limits.max_processes = static_cast<unsigned>(v);
+            } else if (flag == "--max-cpu-sec") {
+                a.limits.max_cpu_seconds = static_cast<unsigned>(v);
+            } else {
+                a.limits.max_file_bytes = v * 1024ull * 1024ull;
+            }
+        }
         else if (s == "-t" || s == "--tier") {
             bool ok = false;
             a.tier = parse_tier(next("--tier"), ok);
@@ -402,6 +436,7 @@ int cmd_run(const Args& a) {
 
     SpawnRequest req;
     req.argv = a.argv;
+    req.limits = a.limits;
     auto result = spawn(policy, req);
 
     if (result.proxy_port != 0) {

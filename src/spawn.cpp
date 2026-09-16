@@ -3,6 +3,7 @@
 #include <spawn.h>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -339,6 +340,49 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
             out.warnings.push_back(ns.reason);
         }
     }
+
+    // RLIMIT_NPROC counts THREADS already owned by this uid system-wide, not
+    // processes in this sandbox. A cap below the current count makes the very
+    // first fork fail with EAGAIN, which surfaces as "/bin/sh: fork: Resource
+    // temporarily unavailable" and looks like a broken toolchain rather than a
+    // limit the user chose. Warn BEFORE running rather than let them debug it.
+    if (req.limits.max_processes > 0) {
+        std::error_code lec;
+        std::size_t threads = 0;
+        const uid_t me = ::getuid();
+        for (const auto& e :
+             std::filesystem::directory_iterator("/proc", lec)) {
+            if (lec) break;
+            const auto name = e.path().filename().string();
+            if (name.empty() || !std::isdigit(static_cast<unsigned char>(name[0]))) {
+                continue;
+            }
+            // Only OUR uid: RLIMIT_NPROC is accounted per real uid.
+            // (`struct stat` and `::stat` collide here, so go through the
+            // filesystem library rather than the POSIX call.)
+            struct ::stat st {};
+            if (::stat(e.path().c_str(), &st) != 0 ||
+                st.st_uid != me) {
+                continue;
+            }
+
+            std::error_code tec;
+            for (const auto& t :
+                 std::filesystem::directory_iterator(e.path() / "task", tec)) {
+                if (tec) break;
+                (void)t;
+                ++threads;
+            }
+        }
+        if (threads > 0 && req.limits.max_processes <= threads) {
+            out.warnings.push_back(
+                "--max-procs " + std::to_string(req.limits.max_processes) +
+                " is at or below the ~" + std::to_string(threads) +
+                " threads this uid already has running; RLIMIT_NPROC counts "
+                "those, so the workload will fail to fork. Raise it well above "
+                "that number -- it is a fork-bomb backstop, not a budget.");
+        }
+    }
 #endif
 
     // Status pipe: the child writes one ChildStage byte if ITS OWN setup fails.
@@ -391,6 +435,38 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         };
 
         if (cwd && ::chdir(cwd) != 0) fail(ChildStage::Chdir, kExitChdirFailed);
+
+        // Resource ceilings. Applied BEFORE confinement so they bound the
+        // sandbox setup too, and before exec so the workload can never run
+        // without them. Lowering the HARD limit is irreversible for an
+        // unprivileged process, so the child cannot raise these back.
+        //
+        // setrlimit failures are deliberately NOT fatal: a ceiling we could
+        // not install is a lost mitigation, not a breach, and refusing to run
+        // would trade a working kernel boundary for nothing.
+        {
+            const auto& L = req.limits;
+            struct rlimit rl {};
+            if (L.max_processes > 0) {
+                rl.rlim_cur = rl.rlim_max = L.max_processes;
+                ::setrlimit(RLIMIT_NPROC, &rl);
+            }
+            if (L.max_file_bytes > 0) {
+                rl.rlim_cur = rl.rlim_max = L.max_file_bytes;
+                ::setrlimit(RLIMIT_FSIZE, &rl);
+            }
+            if (L.max_cpu_seconds > 0) {
+                rl.rlim_cur = rl.rlim_max = L.max_cpu_seconds;
+                ::setrlimit(RLIMIT_CPU, &rl);
+            }
+            if (!L.allow_core_dumps) {
+                // A crashing confined process should not write a memory image
+                // (which can hold secrets read from granted paths) into the
+                // workspace. Cheap, and safe to apply unconditionally.
+                rl.rlim_cur = rl.rlim_max = 0;
+                ::setrlimit(RLIMIT_CORE, &rl);
+            }
+        }
 
         // Own process group, so the ENTIRE subtree (children, grandchildren,
         // anything exec'd) shares one pgid. T0 observation filters audit

@@ -24,6 +24,29 @@ bastion synthesize [--ledger PATH]            turn a session log into a policy
 | `--no-ledger` | do not write an audit log. |
 | `--json` | machine-readable output. |
 
+### Resource ceilings
+
+Opt-in `setrlimit` backstops, inherited by the whole subtree and irreversible
+for an unprivileged child.
+
+| Option | Meaning |
+|---|---|
+| `--max-procs N` | cap processes/threads (fork-bomb backstop) |
+| `--max-file-mb N` | cap the size of any single file the child creates |
+| `--max-cpu-sec N` | cap CPU seconds; a runaway loop dies with `SIGXCPU` |
+
+Off by default: a ceiling that fires during a legitimate build is exactly the
+friction that gets sandboxes switched off. Core dumps are *always* disabled, so
+a crashing child cannot scatter memory images (which may hold secrets read from
+granted paths) into the workspace.
+
+`--max-procs` deserves care. `RLIMIT_NPROC` counts every **thread** already
+owned by your uid system-wide, not the processes in this sandbox — a normal
+desktop session can sit at ~800. Set it well above
+`ps -u $(id -u) -L --no-headers | wc -l`, or the first `fork` fails and the
+build looks broken. bastion warns when your value is below that count. A true
+per-sandbox budget needs a cgroup, which is not implemented.
+
 There is **no fixed sandbox root**. Path-set authority derives the ruleset from
 the actual working directory at spawn time, so `bastion run -- make` works in
 any directory with no symlinks and nothing to pre-create.
@@ -72,7 +95,7 @@ network access. This is the T0 tier, and the input to `synthesize`.
 
 ```sh
 $ bastion observe -- ./weird-legacy-build.sh
-bastion: T0 OBSERVE via seatbelt-report+unified-log — nothing is enforced,
+bastion: T0 OBSERVE via seccomp-user-notify — nothing is enforced,
          every access is recorded. Ctrl-C is safe.
 bastion: recorded 62 access(es)
          next: bastion synthesize
@@ -81,8 +104,10 @@ bastion: recorded 62 access(es)
 **Nothing is enforced during observation.** Only run workloads you would run
 unsandboxed anyway.
 
-> **macOS only.** Linux has no equivalent yet — Landlock cannot
-> allow-and-report. See `docs/linux-bringup.md` §5.4.
+Backends: **macOS** uses Seatbelt's `(with report)` plus the unified log;
+**Linux** uses seccomp user-notification, which is unprivileged and survives
+`execve`, so short-lived grandchildren (`sh -c 'cat …'`) are recorded with
+exact pid attribution rather than an inferred pid window.
 
 ---
 
@@ -191,9 +216,10 @@ requires setuid:  no
 ergonomic floor:
   [ok] writable temp dir
   [ok] /dev/null present
-  [!!] toolchain cache env present
-         -> no CARGO_HOME/GOCACHE/npm_config_cache set; builds will
-            re-download dependencies on every run
+  [ok] toolchain caches granted
+         default:  5 cache dir(s) under $HOME
+
+ready: the floor is satisfied.
 ```
 
 Run it first on a new machine. It reports the live Landlock ABI on Linux.
@@ -207,7 +233,7 @@ Run it first on a new machine. It reports the live Landlock ABI on Linux.
 | `t0` | None. Records only. | Dry runs, CI diffs |
 | `t1` | Best-effort. Stops accidents. | Legacy, unsupported platforms |
 | `t2` | Kernel path-set authority. Survives native code. | **Default** |
-| `t3` | T2 + brokered per-host egress. | Network-touching workloads |
+| `t3` | T2 + brokered per-host egress + PID/IPC isolation (Linux). | Network-touching or untrusted workloads |
 
 T0 and T1 are **not boundaries** against a motivated adversary, and say so.
 

@@ -13,6 +13,58 @@
 
 namespace bastion {
 
+// Resource ceilings applied to the child (setrlimit(2), so they are inherited
+// by the whole subtree and cannot be raised back -- lowering the HARD limit is
+// irreversible for an unprivileged process).
+//
+// WHY: "resource exhaustion" was listed as out of scope, with the honest note
+// that a confined process "can fork-bomb or fill the disk within its granted
+// paths". MEASURED: a T2 child spawned 200 processes unimpeded. A sandbox that
+// stops an agent reading ~/.ssh but lets it wedge the machine has stopped the
+// interesting attack and left the boring one.
+//
+// OFF BY DEFAULT. A limit that fires during a legitimate build is exactly the
+// friction that gets sandboxes switched off (DESIGN.md §4), and the right
+// ceiling is workload-specific -- a Rust build legitimately wants hundreds of
+// processes. So this is opt-in and the defaults below are generous.
+struct ResourceLimits {
+    // Max processes/threads for the child's real uid. 0 = leave alone.
+    //
+    // READ THIS BEFORE PICKING A NUMBER. RLIMIT_NPROC is not what its name
+    // suggests: the kernel counts every THREAD already owned by the real uid,
+    // SYSTEM-WIDE, not the processes inside this sandbox. MEASURED on a normal
+    // desktop session: 113 processes but 787 threads for uid 1000 -- so
+    // --max-procs 512 made `cc` fail to fork immediately, while the same build
+    // succeeded uncapped and at 4000.
+    //
+    // So this is a BACKSTOP against a runaway fork bomb, not a tight budget:
+    // set it above your session's current thread count
+    // (`ps -u $(id -u) -L --no-headers | wc -l`) plus headroom. A tight value
+    // does not confine the workload, it just breaks it.
+    //
+    // A true per-sandbox process budget needs a cgroup (pids.max), which needs
+    // either cgroup-v2 delegation or systemd-run; that is a bigger change and
+    // is not done here.
+    unsigned max_processes = 0;
+
+    // Max size of any file the child creates, in bytes. 0 = leave alone.
+    // Caps "fill the disk", which granted write paths otherwise permit.
+    unsigned long long max_file_bytes = 0;
+
+    // Max CPU seconds. 0 = leave alone. Catches runaway loops; the child gets
+    // SIGXCPU, so it dies visibly rather than hanging a CI job forever.
+    unsigned max_cpu_seconds = 0;
+
+    // Max core dump size. Defaults to 0 = no cores: a crashing confined
+    // process should not scatter memory images (which may hold secrets read
+    // from granted paths) into the workspace.
+    bool allow_core_dumps = false;
+
+    [[nodiscard]] bool any() const noexcept {
+        return max_processes || max_file_bytes || max_cpu_seconds;
+    }
+};
+
 struct SpawnRequest {
     std::vector<std::string> argv;
     std::optional<std::string> cwd;   // defaults to the CURRENT directory:
@@ -20,6 +72,8 @@ struct SpawnRequest {
                                       // so there is no fixed sandbox root.
     std::vector<std::string> env;     // "K=V"; if empty, a sanitized env is built
     bool inherit_env = false;
+
+    ResourceLimits limits;            // opt-in; see above
 
     // When false, spawn() returns as soon as the child is running instead of
     // waiting for it. Required by T0 observation: audit records must be drained
