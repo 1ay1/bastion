@@ -174,6 +174,75 @@ int main() {
         }
     }
 
+    std::puts("\n== 8. --json emits a parseable object, not prose ==");
+    {
+        // `--json` is the primary integration surface for an agent, and it
+        // used to be a no-op: accepted, documented, and emitting nothing
+        // except suppressed advisories. A caller asking for structured output
+        // got an empty stream and had to scrape stderr.
+        //
+        // stdout only -- the human advisories go to stderr, so redirecting
+        // stdout must yield something a parser accepts.
+        const std::string out = "/tmp/bastion-diag-json.txt";
+        const std::string cmd = std::string{BASTION_CLI} + " run --json " +
+                                "--no-ledger -w " + ws.string() +
+                                " -- sh -c 'exit 0' >" + out + " 2>/dev/null";
+        (void)std::system(cmd.c_str());
+
+        std::ifstream f(out);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+
+        check(has(body, "\"exit_code\""), "the summary reports exit_code");
+        check(has(body, "\"tier\""), "...and the tier that was enforced");
+        check(has(body, "\"granted\""), "...and what the policy granted");
+        // The field that lets an agent branch without reading prose.
+        check(has(body, "\"sandbox_implicated\""),
+              "...and whether the SANDBOX caused a failure");
+        // Balanced braces is a cheap structural check that the object is not
+        // truncated; a real parse happens in the shell test above.
+        int depth = 0;
+        bool balanced = true;
+        for (char c : body) {
+            if (c == '{') ++depth;
+            if (c == '}' && --depth < 0) balanced = false;
+        }
+        check(balanced && depth == 0, "the object is well-formed");
+    }
+
+    std::puts("\n== 9. --json distinguishes OUR failure from the workload's ==");
+    {
+        auto json_of = [&](const char* script) {
+            const std::string out = "/tmp/bastion-diag-json2.txt";
+            const std::string cmd =
+                std::string{BASTION_CLI} + " run --json --no-ledger -w " +
+                ws.string() + " -- sh -c '" + script + "' >" + out +
+                " 2>/dev/null";
+            (void)std::system(cmd.c_str());
+            std::ifstream f(out);
+            std::string s((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+            fs::remove(out);
+            return s;
+        };
+
+        // A plain failing command is the workload's own problem.
+        check(has(json_of("exit 3"), "\"sandbox_implicated\":false"),
+              "a genuine failure reports sandbox_implicated=false");
+
+        // A denied exec is ours. Staged binary: writable, but a write grant
+        // carries no execute right.
+        std::error_code ec;
+        fs::copy_file("/bin/sh", ws / "jsonexec",
+                      fs::copy_options::overwrite_existing, ec);
+        if (!ec) {
+            check(has(json_of("./jsonexec -c true"),
+                      "\"sandbox_implicated\":true"),
+                  "a W^X denial reports sandbox_implicated=true");
+        }
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",

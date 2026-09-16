@@ -29,6 +29,47 @@ using namespace bastion;
 
 namespace {
 
+// Minimal JSON string escaping for the --json summary.
+//
+// Duplicated rather than exported from policy.cpp: that one serialises audit
+// records for the ledger, and coupling the CLI's output format to the ledger's
+// on-disk format would mean a change to either silently breaks the other.
+std::string json_str(std::string_view s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                // Control characters must be escaped or the output is not
+                // valid JSON and an agent's parser rejects the whole object.
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                    o += buf;
+                } else {
+                    o += c;
+                }
+        }
+    }
+    return o;
+}
+
+// The op name for a right set, matching the vocabulary used in policy files
+// so an agent can feed `granted` straight back into an [[allow]] block.
+const char* op_for(Right r) {
+    if (any(r & Right::FsWrite))   return "fs.write";
+    if (any(r & Right::FsExec))    return "fs.exec";
+    if (any(r & Right::FsRead))    return "fs.read";
+    if (any(r & Right::NetEgress)) return "net.egress";
+    if (any(r & Right::NetBind))   return "net.bind";
+    return "unknown";
+}
+
 BackendCaps active_backend() {
 #if defined(__APPLE__)
     return darwin::probe();
@@ -653,6 +694,68 @@ int cmd_run(const Args& a) {
         }
         std::fprintf(stderr,
             "         next:    bastion observe -- <cmd> && bastion synthesize\n");
+    }
+
+    // MACHINE-READABLE SUMMARY. `--json` was accepted, documented, and did
+    // nothing except suppress the human advisories -- so an agent that asked
+    // for structured output got an empty stream and had to scrape stderr
+    // prose instead. That is the primary integration surface for the tool's
+    // entire audience, so it emits a real object.
+    //
+    // Written to STDOUT after the workload's own output, as one line, so it
+    // can be tailed or piped to a JSON parser. Everything an agent needs to
+    // decide what happened next: whether it ran, whether the SANDBOX caused
+    // the failure, what was granted, and what to do about it.
+    if (a.json) {
+        std::printf("{\"exit_code\":%d", result.exit_code);
+        std::printf(",\"launched\":%s", result.launched() ? "true" : "false");
+        std::printf(",\"tier\":\"%s\"",
+                    std::string{tier_name(policy.tier())}.c_str());
+        std::printf(",\"unconfined\":%s",
+                    policy.is_unconfined() ? "true" : "false");
+
+        // The distinction that matters most to a caller: did the sandbox do
+        // this, or did the workload fail on its own? Same evidence the human
+        // advisory uses -- never a guess from the exit code alone.
+        std::printf(",\"sandbox_implicated\":%s",
+                    (result.exit_code != 0 && likely_ours) ? "true" : "false");
+
+        if (!result.error.empty()) {
+            std::printf(",\"error\":\"%s\"",
+                        json_str(result.error).c_str());
+        }
+
+        std::printf(",\"granted\":[");
+        bool first = true;
+        for (const auto& r : policy.rules()) {
+            if (r.scope == "*") continue;
+            std::printf("%s{\"op\":\"%s\",\"path\":\"%s\"}",
+                        first ? "" : ",",
+                        op_for(r.right),
+                        json_str(r.scope).c_str());
+            first = false;
+        }
+        std::printf("]");
+
+        std::printf(",\"egress\":{\"allowed\":%llu,\"denied\":%llu,\"refused\":[",
+                    (unsigned long long)result.egress_allowed,
+                    (unsigned long long)result.egress_denied);
+        first = true;
+        for (const auto& [hostport, allowed] : result.egress_attempts) {
+            if (allowed) continue;
+            std::printf("%s\"%s\"", first ? "" : ",",
+                        json_str(hostport).c_str());
+            first = false;
+        }
+        std::printf("]}");
+
+        std::printf(",\"warnings\":[");
+        first = true;
+        for (const auto& w : result.warnings) {
+            std::printf("%s\"%s\"", first ? "" : ",", json_str(w).c_str());
+            first = false;
+        }
+        std::printf("]}\n");
     }
 
     return result.exit_code;

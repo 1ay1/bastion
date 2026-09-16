@@ -55,6 +55,12 @@ add_executable(bastion_cli src/cli.cpp)
 set_target_properties(bastion_cli PROPERTIES OUTPUT_NAME bastion)
 target_link_libraries(bastion_cli PRIVATE bastion)
 
+# `make install` -- an agent harness needs the binary on PATH, and without this
+# every integration has to hardcode a build-tree path that breaks on the next
+# clean build. Honours CMAKE_INSTALL_PREFIX (default /usr/local).
+include(GNUInstallDirs)
+install(TARGETS bastion_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 if(BASTION_HAVE_LANDLOCK_H)
     target_compile_definitions(bastion PUBLIC BASTION_HAVE_LANDLOCK=1)
 endif()

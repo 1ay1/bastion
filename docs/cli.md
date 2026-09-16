@@ -55,6 +55,35 @@ Commands are resolved against the **sandbox's** `PATH`, not yours, so
 only exists in a directory the sandbox cannot execute fails as "not found"
 rather than as a confusing mid-run denial.
 
+### Machine-readable output
+
+`--json` writes one object to **stdout** after the workload's own output; the
+human advisories stay on stderr, so redirecting stdout gives a parser something
+clean.
+
+```sh
+$ bastion run --json -- ./build.sh | tail -1
+{"exit_code":126,"launched":true,"tier":"T2:kernel","unconfined":false,
+ "sandbox_implicated":true,
+ "granted":[{"op":"fs.write","path":"/srv/project"}],
+ "egress":{"allowed":0,"denied":1,"refused":["api.github.com:443"]},
+ "warnings":[]}
+```
+
+| Field | Meaning |
+|---|---|
+| `exit_code` | the workload's own status, passed through |
+| `launched` | false if bastion could not start it at all |
+| `sandbox_implicated` | **the field to branch on** — true only with evidence the boundary caused the failure |
+| `granted` | the effective policy, in the same `op`/`path` vocabulary a policy file uses |
+| `egress.refused` | hosts the broker turned away, ready to feed back into `--net` |
+
+`sandbox_implicated` is deliberately conservative. It is true only when the
+broker refused a host or an exec was denied — never inferred from an exit code
+alone, because `curl` exits 7 for "couldn't connect" and so does a shell script
+that happens to `exit 7`. A false positive sends an agent chasing a policy bug
+that does not exist.
+
 ### Resource ceilings
 
 Opt-in, and off by default: a ceiling that fires during a legitimate build is
