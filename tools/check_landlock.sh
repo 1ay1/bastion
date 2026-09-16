@@ -327,6 +327,30 @@ if [ "$(uname -s)" = "Linux" ]; then
   [ "$ok" -eq 1 ] && echo "OK: the non-Linux branch still compiles"
 fi
 
+# ---------------------------------------------------------------------------
+# POSIX NAMES THAT ARE MACROS ON macOS.
+#
+# Several <signal.h> and <sys/wait.h> names are real FUNCTIONS in glibc but
+# function-like MACROS in Apple's SDK:
+#     #define sigemptyset(set) (*(set) = 0, 0)
+# A `::`-qualified call then expands to `::(*(&x) = 0, 0)`, and clang reports
+# "expected unqualified-id" pointing at the ::. MEASURED: this broke the macOS
+# job while building perfectly here, because glibc has the function.
+#
+# A grep, not a compile, because reproducing it needs Apple's headers. Written
+# so it points straight at the fix rather than at a confusing parse error.
+macro_hits=$(grep -rnE '::(sigemptyset|sigfillset|sigaddset|sigdelset|sigismember|WIFEXITED|WEXITSTATUS|WIFSIGNALED|WTERMSIG|WIFSTOPPED|WSTOPSIG)\(' \
+  --include='*.cpp' --include='*.hpp' "$ROOT/src" "$ROOT/include" "$ROOT/tests" 2>/dev/null \
+  | grep -v '^\s*//' | grep -v 'NOT ::' || true)
+if [ -n "$macro_hits" ]; then
+  echo "FAIL: :: -qualified call to a name that is a MACRO on macOS"
+  echo "      drop the :: -- these are macros in Apple's SDK and functions in glibc"
+  echo "$macro_hits" | head -5
+  fail=1
+else
+  echo "OK: no ::-qualified calls to macOS macros"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "FAILED: Linux spawn path is out of sync with the Landlock backend"
   exit 1

@@ -783,7 +783,7 @@ BackendCaps probe() {
     // broker port. Without it we can only promise T2, and say so.
     if (!c.fs_path_authority) {
         c.max_tier = Tier::Advisory;
-    } else if (abi.has_net_tcp) {
+    } else if (abi.has_net_tcp && c.namespace_isolation) {
         c.max_tier = Tier::Isolate;
     } else {
         c.max_tier = Tier::Kernel;
@@ -791,6 +791,25 @@ BackendCaps probe() {
     c.version_note = abi.note;
     if (c.fs_path_authority && !abi.has_net_tcp) {
         c.version_note += " (no network mediation; T3 needs ABI v4+/kernel 6.7)";
+    }
+    // T3 IS BOTH HALVES, OR IT IS NOT T3.
+    //
+    // MEASURED on a GitHub Actions runner: `doctor` reported "max tier:
+    // T3:isolate" and "namespace isolation: no" in the same breath, because
+    // max_tier was derived from has_net_tcp alone. A T3 sandbox there got
+    // per-host egress filtering and NO PID namespace -- so a detached process
+    // outlived bastion, which is precisely the thing T3 promises to prevent
+    // and the docs say it closes "for free".
+    //
+    // That is silent degradation: the user asks for a tier, is not refused,
+    // and receives less than its name means. Everywhere else bastion refuses
+    // rather than quietly downgrading (T3 below ABI v4 is REFUSED, not
+    // weakened), so this now matches -- the ceiling drops to T2 and --tier t3
+    // is rejected with a reason instead of half-honoured.
+    if (c.fs_path_authority && abi.has_net_tcp && !c.namespace_isolation) {
+        c.version_note +=
+            " (no PID/IPC namespaces available; T3 needs them to reap the "
+            "process tree, so the ceiling is T2)";
     }
     return c;
 }

@@ -41,15 +41,16 @@ extern "C" void forward_to_child(int sig) {
 SignalForwarder::SignalForwarder(pid_t child_pgid) noexcept {
     g_child_pgid = static_cast<std::sig_atomic_t>(child_pgid);
     for (std::size_t i = 0; i < kCount; ++i) {
-        // `struct sigaction sa {}` is ambiguous where sigaction is ALSO a
-        // function (it is, on macOS): clang parses the braces as a function
-        // declarator and reports "expected unqualified-id". Naming the type
-        // without the elaborated-specifier, then value-initialising, is
-        // unambiguous on both platforms.
-        struct sigaction sa;
-        sa = {};
+        struct sigaction sa {};
         sa.sa_handler = forward_to_child;
-        ::sigemptyset(&sa.sa_mask);
+        // NOT ::sigemptyset -- on macOS it is a FUNCTION-LIKE MACRO
+        //     #define sigemptyset(set) (*(set) = 0, 0)
+        // so the qualified call expands to `::(*(&sa.sa_mask) = 0, 0)` and
+        // clang reports "expected unqualified-id" pointing at the ::. glibc
+        // declares a real function, which is why this built here and broke
+        // only on macOS CI. Unqualified works on both: the macro expands, or
+        // the function is found.
+        sigemptyset(&sa.sa_mask);
         // Deliberately NOT SA_RESTART: waitpid() should return EINTR so the
         // supervisor notices promptly rather than blocking until the workload
         // happens to exit on its own. Both callers retry on EINTR, so the only

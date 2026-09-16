@@ -195,10 +195,38 @@ int main() {
     // happened, and both made the test silently vacuous). A beacon written
     // after bastion has exited is unambiguous.
     std::puts("\n== a detached process vs. a CLEAN exit (T2 limit, T3 closes) ==");
+
+    // T3's half of this needs a PID NAMESPACE, which not every host offers --
+    // GitHub Actions runners do not. Ask `doctor`, which is both the user's
+    // own source of truth and free of a link dependency here. Asserting a
+    // guarantee the kernel cannot provide turns a real capability gap into a
+    // red test and hides the failures that matter. Where namespaces are
+    // missing the ceiling is T2 (probe() enforces that), so there is no T3
+    // behaviour to check.
+    bool have_ns = false;
+    {
+        const std::string out = "/tmp/bastion-lifecycle-doctor.txt";
+        (void)std::system((std::string{BASTION_CLI} + " doctor >" + out +
+                           " 2>&1")
+                              .c_str());
+        if (FILE* f = std::fopen(out.c_str(), "rb")) {
+            char buf[4096] = {0};
+            (void)std::fread(buf, 1, sizeof buf - 1, f);
+            std::fclose(f);
+            have_ns = std::strstr(buf, "namespace isolation: yes") != nullptr;
+        }
+        ::unlink(out.c_str());
+    }
+    if (!have_ns) {
+        std::puts("      (no PID namespace on this host -- T3 case skipped; "
+                  "the ceiling is T2 here)");
+    }
+
     struct DetachCase { const char* sub; const char* tier; bool must_die; };
     for (const auto& d : {DetachCase{"run", "t2", false},
                           DetachCase{"run", "t3", true},
                           DetachCase{"observe", "t0", true}}) {
+        if (std::string{d.tier} == "t3" && !have_ns) continue;
         const std::string beacon = std::string{"/tmp/bastion-detach-"} +
                                    d.sub + "-" + d.tier + "-" +
                                    std::to_string(::getpid());
