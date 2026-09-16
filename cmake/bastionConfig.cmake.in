@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+# bastionConfig.cmake -- what `find_package(bastion)` lands on.
+#
+# Kept deliberately thin: it pulls in the exported target set and checks that
+# what it exported is actually there. bastion links no external dependencies
+# (the whole point is that a security boundary should not drag a dependency
+# tree behind it), so there is no find_dependency() block here. If one is ever
+# added to the library, it MUST be mirrored here -- an exported target whose
+# dependencies are not re-found fails at the consumer's link step with an error
+# that points at their code rather than at ours.
+
+include("${CMAKE_CURRENT_LIST_DIR}/bastionTargets.cmake")
+
+check_required_components(bastion)

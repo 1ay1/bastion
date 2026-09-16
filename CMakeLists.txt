@@ -41,8 +41,27 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 add_library(bastion STATIC ${BASTION_SOURCES})
+add_library(bastion::bastion ALIAS bastion)
 target_include_directories(bastion PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+set_target_properties(bastion PROPERTIES
+    # A static archive of a security boundary must not be linked into a shared
+    # object that was built -fPIC without it -- the link fails late and
+    # confusingly. Cheap here, and it keeps embedders' options open.
+    POSITION_INDEPENDENT_CODE ON)
+
+# C++23 is a PUBLIC requirement, not a build setting. The bare
+# CMAKE_CXX_STANDARD above configures OUR compile of OUR sources; it is a
+# directory variable and does not travel with the exported target. So a
+# consumer who defaulted to an older standard got a wall of errors from inside
+# our own installed headers -- capability.hpp uses std::to_underlying (C++23),
+# and the first thing they see is a failure that looks like a bug in bastion.
+#
+# Stating it as a usage requirement makes CMake raise the consumer's standard
+# to meet ours, which is the only place that knowledge can live: the headers
+# are what need it, and only we know that.
+target_compile_features(bastion PUBLIC cxx_std_23)
 
 # Hardening: these are non-negotiable for a security boundary.
 target_compile_options(bastion PRIVATE
@@ -55,11 +74,50 @@ add_executable(bastion_cli src/cli.cpp)
 set_target_properties(bastion_cli PROPERTIES OUTPUT_NAME bastion)
 target_link_libraries(bastion_cli PRIVATE bastion)
 
-# `make install` -- an agent harness needs the binary on PATH, and without this
-# every integration has to hardcode a build-tree path that breaks on the next
-# clean build. Honours CMAKE_INSTALL_PREFIX (default /usr/local).
+# `make install` -- BOTH consumable forms, because bastion is a LIBRARY that
+# also ships a CLI, not a CLI that happens to be built from a library.
+#
+# Installing only the binary (which is what this did) made the library
+# unreachable to anyone outside the source tree: `find_package(bastion)` found
+# nothing, so the only way to embed it was add_subdirectory() on a vendored
+# checkout. agentty can do that because it vendors the submodule; nobody else
+# can, and mcp-cpp's inability to link bastion is exactly why the host-sandbox
+# delegation hook had to exist.
+#
+# Honours CMAKE_INSTALL_PREFIX (default /usr/local).
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 install(TARGETS bastion_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# The library, its headers, and an exported target set. EXPORT_NAME + the
+# bastion:: namespace mean a consumer writes the SAME target name whether it
+# found us via find_package() or add_subdirectory() -- so switching between a
+# vendored and an installed bastion is a one-line change, not a port.
+install(TARGETS bastion
+        EXPORT bastionTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/bastion DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT bastionTargets
+        FILE bastionTargets.cmake
+        NAMESPACE bastion::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/bastion)
+
+# A version file, so a consumer can require a minimum. SameMajorVersion is the
+# honest policy for a 0.x security library: the ABI is not frozen, and a
+# consumer pinning an exact version is better served by the submodule.
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/bastionConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bastionConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/bastionConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/bastion)
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/bastionConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/bastionConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/bastion)
 
 if(BASTION_HAVE_LANDLOCK_H)
     target_compile_definitions(bastion PUBLIC BASTION_HAVE_LANDLOCK=1)
