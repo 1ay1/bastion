@@ -29,14 +29,22 @@ test suite, so the documented boundary cannot drift from the enforced one.
 1. **Kernel exploits.** A Landlock or Seatbelt bypass defeats bastion. Use T4
    (unimplemented) when the kernel is inside your threat model.
 2. **Side channels.** Timing, cache, power. No mitigation.
-3. **Resource exhaustion — partially addressed.** `--max-procs`,
-   `--max-file-mb` and `--max-cpu-sec` install `setrlimit` ceilings on the
-   child (inherited by the subtree, and irreversible for an unprivileged
-   process). Core dumps are always disabled. These are OPT-IN backstops, not
-   quotas: `RLIMIT_NPROC` is accounted per-uid across the whole system, so it
-   cannot express "this sandbox may have N processes". A true per-sandbox
-   budget needs a cgroup (`pids.max`, `memory.max`), which is not implemented.
-   There is still no memory or disk-space quota.
+3. **Resource exhaustion — addressed on Linux, partially elsewhere.** Opt-in
+   ceilings: `--max-procs`, `--max-mem-mb`, `--max-file-mb`, `--max-cpu-sec`.
+   Core dumps are always disabled.
+
+   Where a delegated **cgroup v2** exists (systemd's `user@UID.service`, no
+   root required), `--max-procs` and `--max-mem-mb` are a true PER-SANDBOX
+   budget: `--max-procs 20` means twenty processes *in this sandbox*, and the
+   kernel reports every refusal so an OOM-kill is explained rather than
+   arriving as a bare exit 137. Otherwise bastion falls back to `setrlimit`
+   and **says so** — `RLIMIT_NPROC` is accounted per-uid across the whole
+   system (threads, not processes), so it is a fork-bomb backstop only, and
+   `--max-mem-mb` is dropped entirely because no rlimit means it.
+   `bastion doctor` prints which mechanism you have.
+
+   Still missing: a disk-*space* quota (`--max-file-mb` caps single files, not
+   total bytes written) and CPU weight/quota beyond a wall of CPU-seconds.
 4. **A hostile *host*.** bastion confines children. If the agent host itself is
    compromised, it simply spawns without bastion.
 5. **Data already given.** Anything inside the workspace is readable by design.
@@ -168,8 +176,8 @@ flips and the docs get corrected.
 |---|---|---|
 | Egress is all-or-nothing | T2 | Use `--tier t3` |
 | Host processes visible (`ps aux`) | T2 | Use `--tier t3` on Linux (PID namespace). Still open on macOS, which has no unprivileged equivalent. |
-| No memory or disk-space quota | all | Needs cgroup v2; `--max-file-mb` caps single files only |
-| `--max-procs` is per-uid, not per-sandbox | all | Kernel property of RLIMIT_NPROC; bastion warns when the value is below the uid's current thread count |
+| No disk-space quota | all | `--max-file-mb` caps single files, not total bytes written |
+| `--max-procs`/`--max-mem-mb` need a delegated cgroup | Linux | With one, they are a true per-sandbox budget; without, bastion falls back to RLIMIT_NPROC (per-uid, thread-counted) and reports the downgrade |
 | No mount namespace isolation of the filesystem | all | T3 gets a private mount ns for `/proc`, but does not pivot_root |
 | Kernel exploits | all | Out of scope; T4 |
 | Landlock ABI < v2 denies cross-dir rename | T2 Linux | Kernel 5.19+ |

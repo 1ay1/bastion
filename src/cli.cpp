@@ -20,6 +20,7 @@
 #if defined(__APPLE__)
 #  include "bastion/backend/seatbelt.hpp"
 #elif defined(__linux__)
+#  include "bastion/backend/cgroup.hpp"
 #  include "bastion/backend/landlock.hpp"
 #endif
 
@@ -76,15 +77,23 @@ POLICY OPTIONS
                          stays fully active, so `bastion synthesize` can turn
                          the run into a least-privilege policy afterwards.
 
-RESOURCE LIMITS (opt-in; setrlimit, inherited by the whole subtree)
-  --max-procs N          cap processes/threads (fork-bomb ceiling)
+RESOURCE LIMITS (opt-in)
+  --max-procs N          cap processes in THIS sandbox (cgroup v2 pids.max),
+                         falling back to RLIMIT_NPROC where no delegated
+                         cgroup exists — see below, the meaning differs
+  --max-mem-mb N         cap memory for the whole sandbox (cgroup v2 only)
   --max-file-mb N        cap the size of any file the child creates
   --max-cpu-sec N        cap CPU seconds (runaway loops die with SIGXCPU)
 
   Off by default and deliberately so: a ceiling that fires during a legitimate
-  build is exactly the friction that gets sandboxes turned off, and the right
-  number is workload-specific. Core dumps are always disabled, since a crashing
-  confined process should not write memory images into the workspace.
+  build is exactly the friction that gets sandboxes turned off. Core dumps are
+  always disabled, since a crashing confined process should not write memory
+  images into the workspace.
+
+  With cgroup v2, --max-procs is a TRUE per-sandbox budget: 20 means 20 here.
+  Without it, the fallback is RLIMIT_NPROC, which the kernel counts per-UID
+  across your whole session (threads, not processes) — a fork-bomb backstop
+  only. bastion reports which mechanism it used.
 
 OTHER
   --ledger PATH          audit log location (default ~/.bastion/ledger.jsonl)
@@ -167,7 +176,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--json")                a.json = true;
         else if (s == "--yolo")                a.yolo = true;
         else if (s == "--max-procs" || s == "--max-file-mb" ||
-                 s == "--max-cpu-sec") {
+                 s == "--max-cpu-sec" || s == "--max-mem-mb") {
             const std::string flag{s};
             const std::string_view raw = next(flag.c_str());
             if (!a.error.empty()) return a;
@@ -185,6 +194,8 @@ Args parse(int argc, char** argv) {
                 a.limits.max_processes = static_cast<unsigned>(v);
             } else if (flag == "--max-cpu-sec") {
                 a.limits.max_cpu_seconds = static_cast<unsigned>(v);
+            } else if (flag == "--max-mem-mb") {
+                a.limits.max_memory_bytes = v * 1024ull * 1024ull;
             } else {
                 a.limits.max_file_bytes = v * 1024ull * 1024ull;
             }
@@ -287,6 +298,24 @@ int cmd_doctor() {
     std::printf("net filtering:    %s\n",
                 caps.net_egress_filter ? "yes (by port)" : "no (T3 required)");
     std::printf("namespace isolation: %s\n", caps.namespace_isolation ? "yes" : "no");
+#if defined(__linux__)
+    // Which mechanism a --max-procs would actually get. The two differ in
+    // MEANING, not just quality, so the user needs to know before choosing a
+    // number: a cgroup budget of 20 means 20 processes here, while the rlimit
+    // fallback is counted against every thread the uid owns system-wide.
+    {
+        const auto cg = linux_cgroup::probe();
+        if (cg.available) {
+            std::printf("resource budget:  cgroup v2 (%s%s) \u2014 per-sandbox\n",
+                        cg.pids ? "pids" : "",
+                        cg.memory ? (cg.pids ? "+memory" : "memory") : "");
+        } else {
+            std::printf("resource budget:  setrlimit only \u2014 per-uid, a "
+                        "fork-bomb backstop\n                  (%s)\n",
+                        cg.reason.c_str());
+        }
+    }
+#endif
     std::printf("requires setuid:  %s\n",
                 caps.requires_setuid ? "YES -- REFUSED" : "no");
 

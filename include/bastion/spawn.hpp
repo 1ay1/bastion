@@ -28,24 +28,32 @@ namespace bastion {
 // ceiling is workload-specific -- a Rust build legitimately wants hundreds of
 // processes. So this is opt-in and the defaults below are generous.
 struct ResourceLimits {
-    // Max processes/threads for the child's real uid. 0 = leave alone.
+    // Max processes for the sandbox. 0 = leave alone.
     //
-    // READ THIS BEFORE PICKING A NUMBER. RLIMIT_NPROC is not what its name
-    // suggests: the kernel counts every THREAD already owned by the real uid,
-    // SYSTEM-WIDE, not the processes inside this sandbox. MEASURED on a normal
-    // desktop session: 113 processes but 787 threads for uid 1000 -- so
-    // --max-procs 512 made `cc` fail to fork immediately, while the same build
-    // succeeded uncapped and at 4000.
+    // TWO MECHANISMS, and which one you get changes the MEANING:
     //
-    // So this is a BACKSTOP against a runaway fork bomb, not a tight budget:
-    // set it above your session's current thread count
-    // (`ps -u $(id -u) -L --no-headers | wc -l`) plus headroom. A tight value
-    // does not confine the workload, it just breaks it.
+    //   cgroup v2 (preferred) -- pids.max on a cgroup containing only this
+    //     sandbox. A true per-sandbox budget: `--max-procs 20` means twenty
+    //     processes HERE, regardless of what else the user is running.
     //
-    // A true per-sandbox process budget needs a cgroup (pids.max), which needs
-    // either cgroup-v2 delegation or systemd-run; that is a bigger change and
-    // is not done here.
+    //   setrlimit (fallback) -- RLIMIT_NPROC, which is not what its name
+    //     suggests: the kernel counts every THREAD already owned by the real
+    //     uid SYSTEM-WIDE. MEASURED on an ordinary desktop: 113 processes but
+    //     787 threads, so `--max-procs 512` made `cc` fail its first fork
+    //     while the same build succeeded uncapped. A fork-bomb backstop only;
+    //     set it above your session's thread count, not to a tight budget.
+    //
+    // spawn() reports which one was used, so a number that behaves oddly can
+    // be explained rather than just disbelieved.
     unsigned max_processes = 0;
+
+    // Max resident memory for the WHOLE sandbox, in bytes. 0 = unlimited.
+    //
+    // cgroup-only: there is no rlimit that means this. RLIMIT_AS caps virtual
+    // address space, which modern allocators and sanitizers reserve lavishly,
+    // so capping it breaks working programs long before it stops a leak.
+    // Ignored (with a warning) when no delegated cgroup is available.
+    unsigned long long max_memory_bytes = 0;
 
     // Max size of any file the child creates, in bytes. 0 = leave alone.
     // Caps "fill the disk", which granted write paths otherwise permit.
@@ -61,7 +69,8 @@ struct ResourceLimits {
     bool allow_core_dumps = false;
 
     [[nodiscard]] bool any() const noexcept {
-        return max_processes || max_file_bytes || max_cpu_seconds;
+        return max_processes || max_file_bytes || max_cpu_seconds ||
+               max_memory_bytes;
     }
 };
 

@@ -37,7 +37,7 @@ if(APPLE)
     list(APPEND BASTION_SOURCES src/backend/seatbelt.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND BASTION_SOURCES src/backend/landlock.cpp src/backend/seccomp_notify.cpp
-                                src/backend/namespaces.cpp)
+                                src/backend/namespaces.cpp src/backend/cgroup.cpp)
 endif()
 
 add_library(bastion STATIC ${BASTION_SOURCES})

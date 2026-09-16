@@ -6,6 +6,10 @@
 // for, and they are absent when not.
 #include "bastion/spawn.hpp"
 
+#if defined(__linux__)
+#  include "bastion/backend/cgroup.hpp"
+#endif
+
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -74,10 +78,15 @@ int main() {
 
     std::puts("\n== 4. a too-low process cap is explained, not just broken ==");
     {
-        // RLIMIT_NPROC counts THREADS for the whole uid, so a small number is
-        // almost always wrong. The failure mode ("sh: fork: Resource
-        // temporarily unavailable") looks like a broken toolchain, so bastion
-        // must warn with the real number rather than let the user debug it.
+        // On the FALLBACK path, RLIMIT_NPROC counts THREADS for the whole uid,
+        // so a small number is almost always wrong. The failure mode ("sh:
+        // fork: Resource temporarily unavailable") looks like a broken
+        // toolchain, so bastion must warn with the real number rather than let
+        // the user debug it.
+        //
+        // With a cgroup the number means exactly what the user asked for, so
+        // that warning would be nonsense and is deliberately not emitted --
+        // which is why this assertion is conditional on the mechanism.
         ResourceLimits lim;
         lim.max_processes = 1;  // guaranteed to be below the current count
         auto r = run("echo hi", lim);
@@ -90,10 +99,75 @@ int main() {
             }
         }
 #if defined(__linux__)
-        check(explained,
-              "an unusably low --max-procs warns, naming the thread count");
+        if (linux_cgroup::probe().pids) {
+            check(!explained,
+                  "with a cgroup budget, the per-uid rlimit caveat is NOT "
+                  "reported (it would be misleading)");
+        } else {
+            check(explained,
+                  "an unusably low --max-procs warns, naming the thread count");
+        }
 #else
         check(true, "thread-count warning is Linux-only");
+#endif
+    }
+
+    std::puts("\n== 5. per-sandbox budget (cgroup v2) ==");
+    {
+#if defined(__linux__)
+        const auto caps = linux_cgroup::probe();
+        std::printf("      cgroup: available=%d pids=%d memory=%d\n",
+                    caps.available, caps.pids, caps.memory);
+        if (!caps.available) {
+            // An honest refusal is correct here; the reason must be actionable.
+            check(!caps.reason.empty(),
+                  "no delegated cgroup: the reason is reported, not hidden");
+        } else {
+            if (caps.pids) {
+                // THE POINT OF CGROUPS. A budget this tight is IMPOSSIBLE with
+                // RLIMIT_NPROC, which counts the uid's threads system-wide
+                // (~780 on a desktop): 20 would refuse the very first fork.
+                // Here it means twenty processes in THIS sandbox.
+                ResourceLimits lim;
+                lim.max_processes = 20;
+
+                auto ok = run("echo fits", lim);
+                check(ok.launched() && ok.exit_code == 0,
+                      "a 20-process budget still runs an ordinary command");
+
+                auto bomb = run(
+                    "i=0; while [ $i -lt 60 ]; do sleep 2 & i=$((i+1)); done",
+                    lim);
+                bool reported = false;
+                for (const auto& w : bomb.warnings) {
+                    if (w.find("process limit was hit") != std::string::npos) {
+                        reported = true;
+                    }
+                }
+                check(reported,
+                      "a fork bomb is capped AND the refusal is reported");
+            }
+            if (caps.memory) {
+                ResourceLimits lim;
+                lim.max_memory_bytes = 32ull * 1024 * 1024;
+                auto r = run(
+                    "awk 'BEGIN{s=\"\";for(i=0;i<2000000;i++)s=s\"xxxxxxxxxxxxxxxxxxxx\";print length(s)}'",
+                    lim);
+                bool explained = false;
+                for (const auto& w : r.warnings) {
+                    if (w.find("memory limit was hit") != std::string::npos) {
+                        explained = true;
+                    }
+                }
+                // An OOM kill arrives as a bare SIGKILL (exit 137). Without
+                // this warning it is indistinguishable from the workload
+                // crashing on its own.
+                check(explained,
+                      "an OOM kill is EXPLAINED, not left as a bare exit 137");
+            }
+        }
+#else
+        check(true, "cgroups are Linux-only");
 #endif
     }
 

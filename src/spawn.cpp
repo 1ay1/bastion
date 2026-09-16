@@ -21,6 +21,7 @@
 // Declared at file scope: sandbox_init(3) has no public SDK header.
 extern "C" int sandbox_init(const char* profile, uint64_t flags, char** errorbuf);
 #elif defined(__linux__)
+#  include "bastion/backend/cgroup.hpp"
 #  include "bastion/backend/landlock.hpp"
 #  include "bastion/backend/namespaces.hpp"
 #  include "bastion/proxy.hpp"
@@ -332,6 +333,12 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // T3 process isolation: decided BEFORE fork, because probe() forks and
     // allocates and neither is allowed in the child half of this function.
     bool ns_isolate = false;
+
+    // Per-sandbox budget state. Declared unconditionally so the child block
+    // below (which is compiled on every platform) can reference it.
+    bool cgroup_took_pids = false;
+    std::string cgroup_procs_storage;
+
 #if defined(__linux__)
     if (policy.tier() >= Tier::Isolate && !policy.is_unconfined()) {
         const auto ns = linux_ns::probe();
@@ -341,12 +348,46 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         }
     }
 
+    // A real per-sandbox budget, when the kernel and the session allow one.
+    // Created BEFORE fork so the child can join it the instant it exists, and
+    // held by the parent for the lifetime of the run (its destructor rmdir's
+    // it, which only succeeds once the cgroup is empty).
+    linux_cgroup::Cgroup cg;
+    if (req.limits.max_processes > 0 || req.limits.max_memory_bytes > 0) {
+        cg = linux_cgroup::Cgroup::create(req.limits.max_processes,
+                                          req.limits.max_memory_bytes);
+        if (cg.valid()) {
+            cgroup_took_pids = req.limits.max_processes > 0;
+            // Materialised now: the child may only make async-signal-safe
+            // calls, so the path string cannot be built after fork.
+            cgroup_procs_storage = cg.path() + "/cgroup.procs";
+        } else {
+            // Not fatal: a budget is a mitigation, not a boundary. Losing it
+            // must never become a refusal to run behind a working kernel
+            // boundary -- but it must be SAID, not silently dropped.
+            if (req.limits.max_memory_bytes > 0) {
+                out.warnings.push_back(
+                    "memory limit ignored: " + cg.error() +
+                    " (no rlimit equivalent -- RLIMIT_AS caps address space, "
+                    "not resident memory, and breaks working programs)");
+            }
+            if (req.limits.max_processes > 0) {
+                out.warnings.push_back(
+                    "per-sandbox process budget unavailable: " + cg.error() +
+                    " falling back to RLIMIT_NPROC, which is counted per-uid");
+            }
+        }
+    }
+
     // RLIMIT_NPROC counts THREADS already owned by this uid system-wide, not
     // processes in this sandbox. A cap below the current count makes the very
     // first fork fail with EAGAIN, which surfaces as "/bin/sh: fork: Resource
     // temporarily unavailable" and looks like a broken toolchain rather than a
     // limit the user chose. Warn BEFORE running rather than let them debug it.
-    if (req.limits.max_processes > 0) {
+    //
+    // Only relevant on the FALLBACK path: with a cgroup the number means what
+    // the user thinks it means, and this warning would be nonsense.
+    if (req.limits.max_processes > 0 && !cgroup_took_pids) {
         std::error_code lec;
         std::size_t threads = 0;
         const uid_t me = ::getuid();
@@ -384,6 +425,11 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         }
     }
 #endif
+
+    // Materialised before fork: the child may only make async-signal-safe
+    // calls, so neither the string nor c_str() may happen after it.
+    const char* cgroup_procs =
+        cgroup_procs_storage.empty() ? nullptr : cgroup_procs_storage.c_str();
 
     // Status pipe: the child writes one ChildStage byte if ITS OWN setup fails.
     // O_CLOEXEC means a successful execve closes it without a write, so the
@@ -436,6 +482,34 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
 
         if (cwd && ::chdir(cwd) != 0) fail(ChildStage::Chdir, kExitChdirFailed);
 
+        // Join the per-sandbox cgroup. The CHILD does this to itself rather
+        // than the parent doing it after fork, which would race: the child
+        // could reach execve -- or fork again -- before the parent's write
+        // landed, and anything spawned in that window would escape the budget.
+        // Writing our own pid is race-free by construction.
+        //
+        // Must be here: before namespaces (inside a user namespace the cgroup
+        // directory is no longer ours to write) and before Landlock (which
+        // makes /sys/fs/cgroup unreachable). Only open/write/close, so it is
+        // async-signal-safe.
+        if (cgroup_procs) {
+            const int cfd = ::open(cgroup_procs, O_WRONLY | O_CLOEXEC);
+            if (cfd >= 0) {
+                char buf[24];
+                int n = 0;
+                unsigned long v = static_cast<unsigned long>(::getpid());
+                char tmp[24];
+                int t = 0;
+                if (v == 0) tmp[t++] = '0';
+                while (v > 0) { tmp[t++] = static_cast<char>('0' + v % 10); v /= 10; }
+                while (t > 0) buf[n++] = tmp[--t];
+                (void)::write(cfd, buf, static_cast<std::size_t>(n));
+                ::close(cfd);
+            }
+            // A failure here loses the budget, not the boundary, and the
+            // parent already reported whether the cgroup was created.
+        }
+
         // Resource ceilings. Applied BEFORE confinement so they bound the
         // sandbox setup too, and before exec so the workload can never run
         // without them. Lowering the HARD limit is irreversible for an
@@ -447,7 +521,10 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         {
             const auto& L = req.limits;
             struct rlimit rl {};
-            if (L.max_processes > 0) {
+            // Only when no cgroup took the budget: applying BOTH would mean the
+            // effective cap is the uid-wide rlimit, silently overriding the
+            // per-sandbox number the user actually asked for.
+            if (L.max_processes > 0 && !cgroup_took_pids) {
                 rl.rlim_cur = rl.rlim_max = L.max_processes;
                 ::setrlimit(RLIMIT_NPROC, &rl);
             }
@@ -548,6 +625,29 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     if (!req.wait) return out;  // caller will spawn_wait() later
 
     spawn_wait(out);
+
+#if defined(__linux__)
+    // Ask the KERNEL whether it refused anything, rather than leaving the user
+    // to decode a bare exit code. A memory kill arrives as SIGKILL (exit 137)
+    // with no message at all, and a pids refusal surfaces only as the
+    // workload's own "fork: Resource temporarily unavailable" -- both look
+    // like the workload broke on its own. cgroup.events records the truth.
+    if (cg.valid()) {
+        if (const auto hits = cg.memory_max_hits(); hits > 0) {
+            out.warnings.push_back(
+                "the memory limit was hit " + std::to_string(hits) +
+                " time(s); the kernel OOM-killed the workload (exit 137 is "
+                "SIGKILL, not a crash in your program). Raise --max-mem-mb.");
+        }
+        if (const auto hits = cg.pids_max_hits(); hits > 0) {
+            out.warnings.push_back(
+                "the process limit was hit " + std::to_string(hits) +
+                " time(s) (peak " + std::to_string(cg.peak_pids()) +
+                " processes); forks inside the sandbox were refused. "
+                "Raise --max-procs.");
+        }
+    }
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
     // Harvest the broker's ledger before it is torn down. Every egress

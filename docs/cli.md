@@ -26,26 +26,37 @@ bastion synthesize [--ledger PATH]            turn a session log into a policy
 
 ### Resource ceilings
 
-Opt-in `setrlimit` backstops, inherited by the whole subtree and irreversible
-for an unprivileged child.
+Opt-in, and off by default: a ceiling that fires during a legitimate build is
+exactly the friction that gets sandboxes switched off.
 
 | Option | Meaning |
 |---|---|
-| `--max-procs N` | cap processes/threads (fork-bomb backstop) |
+| `--max-procs N` | cap processes in this sandbox |
+| `--max-mem-mb N` | cap memory for the whole sandbox (cgroup only) |
 | `--max-file-mb N` | cap the size of any single file the child creates |
 | `--max-cpu-sec N` | cap CPU seconds; a runaway loop dies with `SIGXCPU` |
 
-Off by default: a ceiling that fires during a legitimate build is exactly the
-friction that gets sandboxes switched off. Core dumps are *always* disabled, so
-a crashing child cannot scatter memory images (which may hold secrets read from
-granted paths) into the workspace.
+Core dumps are *always* disabled, so a crashing child cannot scatter memory
+images (which may hold secrets read from granted paths) into the workspace.
 
-`--max-procs` deserves care. `RLIMIT_NPROC` counts every **thread** already
-owned by your uid system-wide, not the processes in this sandbox — a normal
-desktop session can sit at ~800. Set it well above
-`ps -u $(id -u) -L --no-headers | wc -l`, or the first `fork` fails and the
-build looks broken. bastion warns when your value is below that count. A true
-per-sandbox budget needs a cgroup, which is not implemented.
+**Two mechanisms, and the meaning differs.** Run `bastion doctor` to see which
+one you have:
+
+- **cgroup v2** (`resource budget: cgroup v2 (pids+memory) — per-sandbox`).
+  Requires a delegated cgroup — systemd's `user@UID.service` gives every login
+  session one, with no root needed. `--max-procs 20` means *twenty processes in
+  this sandbox*, and `--max-mem-mb` works.
+- **setrlimit fallback** (`resource budget: setrlimit only — per-uid`).
+  `--max-procs` becomes `RLIMIT_NPROC`, which counts every **thread** owned by
+  your uid system-wide — a desktop session sits around 800 — so it is only a
+  fork-bomb backstop. Set it well above
+  `ps -u $(id -u) -L --no-headers | wc -l` or the first `fork` fails and the
+  build looks broken; bastion warns when your value is below that count.
+  `--max-mem-mb` is dropped with a warning, because no rlimit expresses it
+  (`RLIMIT_AS` caps address space, which allocators reserve lavishly).
+
+When the kernel refuses something, bastion says so — an OOM kill is reported as
+such rather than surfacing as an unexplained exit 137.
 
 There is **no fixed sandbox root**. Path-set authority derives the ruleset from
 the actual working directory at spawn time, so `bastion run -- make` works in
@@ -222,7 +233,22 @@ ergonomic floor:
 ready: the floor is satisfied.
 ```
 
-Run it first on a new machine. It reports the live Landlock ABI on Linux.
+On Linux it additionally reports the live Landlock ABI, whether process
+isolation is available, and which resource-budget mechanism you get:
+
+```sh
+$ bastion doctor
+backend:     landlock
+note:        Landlock ABI v10
+max tier:    T3:isolate
+path authority:   yes
+net filtering:    yes (by port)
+namespace isolation: yes
+resource budget:  cgroup v2 (pids+memory) — per-sandbox
+requires setuid:  no
+```
+
+Run it first on a new machine.
 
 ---
 
