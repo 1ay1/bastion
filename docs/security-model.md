@@ -98,7 +98,7 @@ prints its own totals and `tools/check_claims.sh` (a `ctest` case) diffs them
 against this file, the README, DESIGN.md and the architecture doc. Add an
 attack and the build fails until the prose is corrected.
 
-### 3.1 Adversarial suite: 35 attempts, 0 escapes
+### 3.1 Adversarial suite: 38 attempts, 0 escapes
 
 | Class | Attempts | Result |
 |---|---|---|
@@ -109,6 +109,7 @@ attack and the build fails until the prose is corrected.
 | Credential theft (`~/.ssh`, `~/.aws`, keyring, history, `.gitconfig`, `.npmrc`, cloud tokens) | 11 | Blocked |
 | Inherited descriptors | 2 | Blocked (§4.1) |
 | Persistence writes (`/etc`, `~/.zshrc`, `/usr/local/bin`, LaunchAgents) | 4 | Blocked |
+| Attacks on the POLICY itself (global config, ledger, a planted `bastion.toml`) | 3 | Blocked (§4.5) |
 | T2 limits, and T3 closing them (egress, raw socket, PID table, `/`, `/home`, `/etc/shadow`) | 6 | Blocked |
 | Path *existence* probing | 1 | **Limit** (§5) |
 | — | | |

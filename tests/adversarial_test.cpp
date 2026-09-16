@@ -262,6 +262,23 @@ int main() {
     must_deny("create a LaunchAgent (persistence)",
               run("echo x > ~/Library/LaunchAgents/pwn.plist 2>/dev/null"));
 
+    std::puts("\n== 7b. attacks on the POLICY, not on the sandbox ==");
+    // Every section above tries to break OUT of a policy. This one tries to
+    // CHANGE it -- the class the suite originally missed, and the class that
+    // produced its only critical bug (security-model 4.5): `bastion run`
+    // auto-discovered ./bastion.toml, which the confined workload can write,
+    // so the agent granted itself $HOME in two invocations.
+    //
+    // The general rule being asserted: an input the sandbox reads from inside
+    // its own blast radius must not carry authority. These check the files a
+    // confined workload can reach and bastion might later believe.
+    must_deny("overwrite the operator's global bastion config",
+              run("echo 'tier=\"t0\"' > ~/.bastion/config.toml 2>/dev/null"));
+    must_deny("tamper with the audit ledger",
+              run("echo '{}' >> ~/.bastion/ledger.jsonl 2>/dev/null"));
+    must_deny("drop a policy where a PARENT project would discover it",
+              run("echo 'tier=\"t0\"' > /tmp/bastion.toml 2>/dev/null"));
+
     std::puts("\n== 8. the workspace still works ==");
     must_allow("write in workspace", run("echo ok > /tmp/bastion-adv/f.txt"));
     must_allow("read back", run("grep -q ok /tmp/bastion-adv/f.txt"));

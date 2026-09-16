@@ -14,7 +14,7 @@ bastion run --policy bastion.toml -- ./legacy-build.sh
 
 | | |
 |---|---|
-| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 31/31 tests, 35 adversarial escape attempts, **0 escapes**. One residual limit is named and asserted rather than hidden — path *existence* is probeable, though contents are not. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
+| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 31/31 tests, 38 adversarial escape attempts, **0 escapes**. One residual limit is named and asserted rather than hidden — path *existence* is probeable, though contents are not. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
 | **macOS** | Best-effort. A Seatbelt backend exists and the shared code is syntax-checked for `__APPLE__` in CI, but it has **not been run or measured** since the Linux hardening work. Treat it as unverified. |
 | **Windows** | Specified only (AppContainer + restricted token). Not implemented. |
 
@@ -163,12 +163,22 @@ negative_compile_4 ... Passed   # laundering Unconfined in with normal rights
 
 ## Verified, not asserted
 
-**35 real escape attempts, 0 escapes** — symlink farms pointed at `/etc` and
+**38 real escape attempts, 0 escapes** — symlink farms pointed at `/etc` and
 `/`, `../` traversal, sibling-prefix confusion, copying `sh` into the workspace
 to shed policy, `~/.ssh` + `~/.aws` + keyring + shell history,
 `DYLD_INSERT_LIBRARIES` injection, LaunchAgent persistence, T3 proxy bypass.
 The count is printed by the suite and checked against this file by `ctest`, so
 it cannot go stale.
+
+**What the suite did not catch.** Every attack above tries to break *out* of a
+policy. None of them tried to **change the policy**, and that is where the
+worst bug was: `bastion run` auto-discovered `./bastion.toml`, which the
+confined workload can write. Two invocations — one to write the file, one to be
+governed by it — and the sandbox handed over `~/.ssh`. Found by using the tool,
+not by reviewing it. Discovered policies may now only *narrow*; `--policy` is
+the operator speaking and still grants in full ([security-model §4.5](docs/security-model.md)).
+The lesson generalises: audit what the sandbox **trusts**, not just what it
+denies — an input inside the blast radius is not an input.
 
 **The escape this found:** on both Seatbelt and Landlock, access rights attach to
 the **open file description**, not the path. A descriptor opened *before*

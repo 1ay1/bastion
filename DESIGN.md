@@ -272,7 +272,7 @@ sandbox that is only safe when every caller is careful is not a boundary.
 
 ### 6.2 Verified with adversarial tests, not assertions
 
-`tests/adversarial_test.cpp` runs 35 real escape attempts: **0 escapes**.
+`tests/adversarial_test.cpp` runs 38 real escape attempts: **0 escapes**.
 
 | Class | Attempts | Notable |
 |---|---|---|
@@ -283,6 +283,7 @@ sandbox that is only safe when every caller is careful is not a boundary.
 | Credential theft | 11 | `~/.ssh`, `~/.aws`, keyring, history, `.gitconfig`, `.npmrc`, cloud tokens |
 | Inherited descriptors | 2 | raw `read(2)` and `/dev/fd/N` (§6.1) |
 | Persistence writes | 4 | `/etc`, `~/.zshrc`, `/usr/local/bin`, LaunchAgents |
+| Attacks on the POLICY | 3 | overwrite the global config, tamper with the ledger, plant a policy a parent project would discover |
 | Tier limits, and T3 closing them | 6 | egress, raw socket, PID table, `/`, `/home`, `/etc/shadow` |
 | Path *existence* probing | 1 | the one documented limit; asserted both ways |
 | Environment hygiene | 1 | `DYLD_INSERT_LIBRARIES` + `*_TOKEN` stripped (positive) |
