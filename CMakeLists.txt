@@ -160,6 +160,17 @@ if(BASTION_BUILD_TESTS)
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
     endforeach()
 
+    # Lifecycle: killing bastion must take the sandboxed SUBTREE with it.
+    # Agent harnesses kill on timeout, so a surviving workload leaks a process
+    # per attempt -- and an orphan still holds whatever the policy granted.
+    add_executable(lifecycle_test tests/lifecycle_test.cpp)
+    target_link_libraries(lifecycle_test PRIVATE bastion)
+    target_compile_definitions(lifecycle_test PRIVATE
+        BASTION_CLI="$<TARGET_FILE:bastion_cli>")
+    add_dependencies(lifecycle_test bastion_cli)
+    add_test(NAME lifecycle COMMAND lifecycle_test)
+    set_tests_properties(lifecycle PROPERTIES TIMEOUT 120)
+
     # Diagnostics: does a FAILING run tell an agent enough to recover? Checks
     # both directions -- guidance on a real denial, and SILENCE on a genuine
     # test failure, because a false "maybe it was the sandbox" sends the agent
