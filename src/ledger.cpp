@@ -162,9 +162,27 @@ bool covered_by_floor(std::string_view op, std::string_view path) {
 void Ledger::record(const AuditRecord& rec) { records_.push_back(rec); }
 
 std::string Ledger::flush() {
+    rotated_ = false;
     std::error_code ec;
     auto dir = std::filesystem::path{path_}.parent_path();
     if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+
+    // Rotate BEFORE appending, so this run's records land in the fresh file
+    // rather than being split across the boundary. A session that straddles
+    // two files would be invisible to synthesize(), which scopes to the last
+    // proc.spawn marker.
+    if (max_bytes_ > 0) {
+        const auto sz = std::filesystem::file_size(path_, ec);
+        if (!ec && sz >= max_bytes_) {
+            const std::string prev = path_ + ".1";
+            std::error_code rec;
+            std::filesystem::rename(path_, prev, rec);
+            // A failed rotation is not fatal: appending to an oversized
+            // ledger is worse than ideal, but losing the record entirely is
+            // worse still. The caller sees rotated_ == false and carries on.
+            rotated_ = !rec;
+        }
+    }
 
     std::ofstream f(path_, std::ios::app);
     if (!f) return "cannot open ledger for writing: " + path_;

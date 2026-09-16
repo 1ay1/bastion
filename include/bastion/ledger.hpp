@@ -29,7 +29,27 @@ public:
     void record(const AuditRecord& rec);
 
     // Flush to disk as JSON Lines. Returns an error string, or empty on success.
+    //
+    // Rotates first when the file exceeds max_bytes: the current ledger is
+    // renamed to <path>.1 (replacing any previous .1) and a fresh one started.
+    // Append-only with no bound means a long-lived agent host grows the file
+    // forever -- MEASURED at 89 bytes per run, so ~8MB per 100k runs and ~84MB
+    // per million. That is slow enough to go unnoticed and large enough to
+    // matter on a CI runner that never reboots.
+    //
+    // ONE generation is kept deliberately. The ledger's purpose is feeding
+    // `synthesize`, which already scopes to the last session, so deep history
+    // has no consumer -- keeping more would trade real disk for data nothing
+    // reads. Rotation is never silent: the caller is told, because an audit
+    // log that quietly discards records is worse than one that grows.
     [[nodiscard]] std::string flush();
+
+    // Bytes after which flush() rotates. 0 disables rotation entirely, for a
+    // caller who is managing retention themselves.
+    void set_max_bytes(std::uintmax_t n) noexcept { max_bytes_ = n; }
+
+    // Set by flush() when it rotated, so the CLI can say so once.
+    [[nodiscard]] bool rotated() const noexcept { return rotated_; }
 
     [[nodiscard]] const std::vector<AuditRecord>& records() const noexcept {
         return records_;
@@ -41,6 +61,11 @@ public:
 private:
     std::string path_;
     std::vector<AuditRecord> records_;
+    // 32 MiB: roughly 375k runs of spawn records, or several very large
+    // observation sessions. Big enough that normal use never rotates, small
+    // enough that an unattended host cannot fill a disk with audit data.
+    std::uintmax_t max_bytes_ = 32u * 1024u * 1024u;
+    bool rotated_ = false;
 };
 
 // ---------------------------------------------------------------------------

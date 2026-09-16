@@ -742,6 +742,13 @@ int cmd_run(const Args& a) {
         led.record(rec);
         if (auto err = led.flush(); !err.empty()) {
             std::fprintf(stderr, "bastion: [warning] ledger: %s\n", err.c_str());
+        } else if (led.rotated()) {
+            // Never silent: an audit log that quietly discards history is
+            // worse than one that grows, so say which file the old records
+            // moved to.
+            std::fprintf(stderr,
+                         "bastion: ledger rotated; previous history is now %s.1\n",
+                         a.ledger.c_str());
         }
     }
 
@@ -977,6 +984,10 @@ int cmd_observe(const Args& a) {
         for (const auto& r : res.records) led.record(r);
         if (auto err = led.flush(); !err.empty()) {
             std::fprintf(stderr, "bastion: [warning] ledger: %s\n", err.c_str());
+        } else if (led.rotated()) {
+            std::fprintf(stderr,
+                         "bastion: ledger rotated; previous history is now %s.1\n",
+                         a.ledger.c_str());
         }
     }
 

@@ -20,7 +20,7 @@ bastion synthesize [--ledger PATH]            turn a session log into a policy
 | `--net HOST:PORT` | allow egress. Wildcards: `*.example.com`. Repeatable. |
 | `-t, --tier TIER` | `t0`/`t1`/`t2`/`t3`. Default `t2`. |
 | `--yolo` | grant `Unconfined`. Auditing stays active. |
-| `--ledger PATH` | audit log. Default `~/.bastion/ledger.jsonl`, or `$BASTION_LEDGER`. |
+| `--ledger PATH` | audit log. Default `~/.bastion/ledger.jsonl`, or `$BASTION_LEDGER`. Rotates at 32 MiB, keeping one previous generation as `PATH.1`, so an unattended host cannot fill a disk with audit data. Rotation is reported, never silent. |
 | `--no-ledger` | do not write an audit log. |
 | `--json` | machine-readable output. |
 

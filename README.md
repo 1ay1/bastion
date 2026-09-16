@@ -14,7 +14,7 @@ bastion run --policy bastion.toml -- ./legacy-build.sh
 
 | | |
 |---|---|
-| **macOS** | Working. T2 + T3, 13/13 tests, 29 adversarial escape attempts, 0 escapes. |
+| **macOS** | Working as of the last macOS run: T2 + T3, 13/13 tests, 29 adversarial escape attempts, 0 escapes. **Not re-measured since the Linux hardening work** — the shared code compiles clean for `__APPLE__` and the Seatbelt path is syntax-checked in CI, but the numbers above predate it. Re-run `ctest` on a Mac before relying on them. |
 | **Linux** | Working, and the most complete backend. T0–T3 **measured on kernel 7.2.2 (Landlock ABI v10)**: 30/30 tests, 30 adversarial escape attempts, **0 escapes and 0 documented limits**. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
 | **Windows** | Specified only (AppContainer + restricted token). |
 

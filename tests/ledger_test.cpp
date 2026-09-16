@@ -325,6 +325,70 @@ int main() {
               "last_session_only=false still mines the whole history");
     }
 
+    std::puts("\n== the ledger is size-bounded ==");
+    {
+        // Append-only with no bound means a long-lived agent host grows the
+        // file forever. MEASURED at 89 bytes per run: ~8MB per 100k runs,
+        // ~84MB per million -- slow enough to go unnoticed, large enough to
+        // matter on a CI runner that never reboots.
+        const std::string lp = "/tmp/bastion-ledger-test/rot.jsonl";
+        std::error_code ec;
+        fs::remove(lp, ec);
+        fs::remove(lp + ".1", ec);
+
+        // A small cap keeps the test fast; the mechanism is the same at 32MiB.
+        auto write_batch = [&](std::size_t n) {
+            Ledger l{lp};
+            l.set_max_bytes(4096);
+            for (std::size_t i = 0; i < n; ++i) {
+                AuditRecord r;
+                r.verdict = Verdict::Allow;
+                r.op = "proc.spawn";
+                r.target = "/bin/true";
+                l.record(r);
+            }
+            const std::string err = l.flush();
+            return std::pair{err, l.rotated()};
+        };
+
+        // First batch is under the cap: no rotation.
+        auto [e1, r1] = write_batch(4);
+        check(e1.empty() && !r1, "a small ledger does not rotate");
+
+        // Push it over, then write again -- the NEXT flush rotates.
+        (void)write_batch(200);
+        auto [e2, r2] = write_batch(1);
+        check(e2.empty() && r2, "an oversized ledger rotates on the next write");
+        check(fs::exists(lp + ".1", ec), "...and the history is kept as .1");
+
+        // The live file restarts small, which is the whole point.
+        check(fs::file_size(lp, ec) < 4096,
+              "...and the live ledger starts fresh");
+
+        // Repeated rotation must not accumulate generations: .2 would mean
+        // unbounded growth by another name.
+        (void)write_batch(200);
+        (void)write_batch(1);
+        check(!fs::exists(lp + ".2", ec),
+              "only ONE generation is kept, so total size stays bounded");
+
+        // Opting out for a caller managing retention themselves.
+        {
+            Ledger l{lp};
+            l.set_max_bytes(0);
+            AuditRecord r;
+            r.verdict = Verdict::Allow;
+            r.op = "proc.spawn";
+            r.target = "/bin/true";
+            l.record(r);
+            (void)l.flush();
+            check(!l.rotated(), "max_bytes=0 disables rotation");
+        }
+
+        fs::remove(lp, ec);
+        fs::remove(lp + ".1", ec);
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "all ledger tests passed" : "FAILURES",
                 failures, failures == 1 ? "" : "s");
