@@ -4,7 +4,7 @@ Everything you need to get bastion enforcing on Linux.
 
 **STATUS: the Landlock backend now runs, enforces, and passes its full suite on
 a real kernel.** First bring-up measured on **kernel 7.2.2-zen1 (Landlock ABI
-v10), GCC 16.2.1**: 27/27 tests green, adversarial suite 30 attempts / 0
+v10), GCC 16.2.1**: 28/28 tests green, adversarial suite 30 attempts / 0
 escapes, T3 per-host egress verified end to end against a live host.
 
 Five real bugs were found the moment it touched hardware; all are fixed, and
@@ -51,7 +51,7 @@ max tier:    T3:isolate
 path authority:   yes
 net filtering:    yes (by port)
 $ ctest
-100% tests passed out of 27
+100% tests passed out of 28
 ```
 
 Still open on Linux: T4 (microVM) is unimplemented, and the distro/ABI matrix
@@ -301,7 +301,7 @@ Work top to bottom. Each item is a claim that is currently **unverified**.
 ### 6.1 Basics
 
 - [x] `bastion doctor` reports `landlock` and the expected ABI version (v10)
-- [x] `ctest` passes — 27/27 on 7.2.2
+- [x] `ctest` passes — 28/28 on 7.2.2
 - [x] Write inside the workspace succeeds
 - [x] Read outside the workspace fails
 - [x] `/etc/shadow`, `~/.ssh`, `~/.aws` all denied
@@ -334,12 +334,28 @@ fool). The Linux build substitutes a portable equivalent.
 
 ### 6.3 ABI compatibility (the part most likely to break)
 
-- [ ] v1 kernel (5.13–5.18): ruleset applies, `FS_REFER` warning appears
-- [ ] v4+ kernel: `--tier t3` accepted
-- [ ] **Old kernel, new headers**: build on 6.12+, run on 5.15. This is what
-      `AbiInfo::ruleset_attr_size()` exists for — `landlock_ruleset_attr` has
-      grown to 6 × `__u64`, and passing `sizeof()` to an older kernel is
-      rejected. If this fails, the size table is wrong.
+Mostly automated now. `tests/abi_matrix_test.cpp` exercises **every ABI level
+v1–v10 on whatever kernel you have**, because `compile()` is a pure function of
+`(policy, AbiInfo)` — nothing in it reads the running kernel, so a synthetic
+`AbiInfo` covers the degradation paths that a v10 box could otherwise never
+reach. It asserts the synthetic mapping against the real `probe_abi()` first,
+so the tests cannot drift into testing a fiction.
+
+- [x] No ruleset ever requests a right newer than its kernel (EINVAL would take
+      the **entire** sandbox down, not just that right)
+- [x] `ruleset_attr_size()` never exceeds what each version accepts — this is
+      the "build on 6.12+, run on 5.15" case; `landlock_ruleset_attr` has grown
+      to 6 × `__u64` and passing `sizeof()` to an older kernel is rejected
+- [x] T3 **refuses** below v4 instead of degrading, and the error names v4
+- [x] v4+ pins the broker port (the enum-vs-macro bug would fail this)
+- [x] Every level below v6 **warns** about what it cannot enforce — this found
+      a real gap: v3/v4 warned about nothing despite unmediated `ioctl()`
+- [x] The ergonomic floor is granted at every level, so a dynamically-linked
+      binary still runs on a v1 kernel
+
+Still needs real hardware (a synthetic `AbiInfo` cannot fake these):
+
+- [ ] v1 kernel (5.13–5.18): the kernel actually **accepts** the ruleset
 - [ ] Landlock disabled (`lsm=` without it): bastion **refuses to run** at T2
       rather than running unconfined
 

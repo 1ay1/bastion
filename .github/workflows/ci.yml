@@ -70,18 +70,14 @@ jobs:
       - name: Doctor reports the real ABI, whatever it is
         run: ./build/bastion doctor
       - name: Test
-        # THE POINT OF THIS JOB. Development happens on a current kernel
-        # (ABI v10), where every capability is present -- so the version-gating
-        # code is never exercised there. This runner is deliberately older, and
-        # is the only place the "built on a new kernel, must still confine on an
-        # old one" path gets tested: attr-size clamping, T3 refusing below ABI
-        # v4 instead of silently degrading, and the ergonomic floor coping with
-        # a different distro layout.
-        #
-        # Advisory for now: this configuration has not been characterised yet,
-        # so a failure is information, not a known regression. Flip this to
-        # blocking once docs/linux-bringup.md §6.3 has been worked through.
-        continue-on-error: true
+        # NOW BLOCKING. It was advisory while this configuration was
+        # uncharacterised, but tests/abi_matrix_test.cpp exercises every ABI
+        # level v1-v10 against synthetic AbiInfo -- compile() is a pure
+        # function of (policy, AbiInfo), so the degradation paths are covered
+        # on ANY kernel. What this runner adds is the part that cannot be
+        # synthesised: a real older kernel actually accepting the ruleset, a
+        # different distro layout under the ergonomic floor, and whatever
+        # seccomp/namespace policy the runner imposes.
         run: ctest --test-dir build --output-on-failure
 
   portability:

@@ -160,6 +160,16 @@ if(BASTION_BUILD_TESTS)
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
     endforeach()
 
+    # ABI degradation across v1-v10, WITHOUT needing ten kernels: compile() is
+    # a pure function of (policy, AbiInfo), so every version can be exercised
+    # here. Development happens on v10 where every capability exists, so the
+    # version-gating code is otherwise never run.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(abi_matrix_test tests/abi_matrix_test.cpp)
+        target_link_libraries(abi_matrix_test PRIVATE bastion)
+        add_test(NAME abi_matrix COMMAND abi_matrix_test)
+    endif()
+
     # Invariant types: Result<T> (no unchecked failures) and UniqueFd (no
     # leaked descriptors). A leaked fd is not just a resource here -- rights
     # attach to the open file description, so it is authority.

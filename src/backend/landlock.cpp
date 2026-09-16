@@ -219,6 +219,23 @@ Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
             "Landlock ABI <3: truncate() is not mediated, so a granted-read "
             "file may still be truncated.");
     }
+    if (!abi.has_ioctl_dev) {
+        // Found by the ABI matrix test: v3 and v4 warned about NOTHING, even
+        // though ioctl(2) on a granted device is unmediated there. A tier that
+        // quietly enforces less than it promises is the failure mode this
+        // project exists to prevent, so every gap gets a sentence.
+        rs.warnings.emplace_back(
+            "Landlock ABI <5: ioctl() on device files is not mediated, so a "
+            "granted device can be reconfigured through an ioctl this policy "
+            "cannot see; kernel 6.10+ adds FS_IOCTL_DEV.");
+    }
+    if (!abi.has_scoped) {
+        rs.warnings.emplace_back(
+            "Landlock ABI <6: abstract UNIX sockets and signals are not "
+            "scoped, so the sandbox can signal and connect to processes "
+            "outside it; kernel 6.12+ adds LANDLOCK_SCOPE_*. Use --tier t3 "
+            "for IPC isolation via namespaces.");
+    }
 
     // The ergonomic floor (DESIGN.md §4): without these, toolchains break in
     // ways that look like broken code and burn agent turns.
