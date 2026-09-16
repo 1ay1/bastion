@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 
+#include <cerrno>
 #include <filesystem>
 #include <sstream>
 #include <unordered_set>

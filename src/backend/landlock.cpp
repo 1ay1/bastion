@@ -12,6 +12,50 @@
 #  if __has_include(<linux/landlock.h>)
 #    include <linux/landlock.h>
 #    define BASTION_LANDLOCK_HEADERS 1
+
+// THE BUILD HEADER IS NOT THE RUNTIME KERNEL.
+//
+// Every newer access right is gated at RUNTIME (abi.has_refer and friends), so
+// the code already degrades correctly on an old kernel. But the gate is an
+// `if`, not an `#if`: the CONSTANTS still have to exist at compile time. On a
+// distro whose linux/landlock.h predates them -- Ubuntu 22.04, which is what
+// the older-ABI CI job runs -- the build FAILED OUTRIGHT with "was not
+// declared in this scope".
+//
+// That is the exact failure abi_matrix_test was written to prevent, and it
+// could not catch it: that test feeds synthetic AbiInfo to compile() to prove
+// the RUNTIME logic degrades. It says nothing about whether the translation
+// unit compiles somewhere else, because it compiles here. Development on ABI
+// v10 hides this completely.
+//
+// Two DIFFERENT problems live here, and conflating them creates a worse bug
+// than the one being fixed:
+//
+//   VALUES -- LANDLOCK_ACCESS_FS_REFER and friends are plain bit constants,
+//     fixed by the kernel's UAPI contract forever. Defining them when absent
+//     is safe: an old kernel rejects a ruleset asking for a right it does not
+//     know, and the runtime gates already prevent that.
+//
+//   SHAPES -- the NETWORK support (v4) is not just constants. It needs
+//     `landlock_ruleset_attr::handled_access_net`, `struct
+//     landlock_net_port_attr` and the LANDLOCK_RULE_NET_PORT enumerator, none
+//     of which can be conjured with #define. The net code is therefore guarded
+//     by `#if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)` as a proxy for "this
+//     header knows about networking at all".
+//
+// So the net constants are deliberately NOT defined here. Defining them would
+// flip that guard to true against a v1 header and break the build in a new
+// place -- the fix causing the failure it was meant to prevent. T3 egress
+// filtering is refused at runtime on such kernels anyway.
+#    ifndef LANDLOCK_ACCESS_FS_REFER
+#      define LANDLOCK_ACCESS_FS_REFER (1ULL << 13)
+#    endif
+#    ifndef LANDLOCK_ACCESS_FS_TRUNCATE
+#      define LANDLOCK_ACCESS_FS_TRUNCATE (1ULL << 14)
+#    endif
+#    ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
+#      define LANDLOCK_ACCESS_FS_IOCTL_DEV (1ULL << 15)
+#    endif
 #  endif
 #endif
 
@@ -97,7 +141,15 @@ std::uint64_t fs_mask_for(const AbiInfo& abi) {
 
 std::uint64_t net_mask_for(const AbiInfo& abi) {
     if (!abi.has_net_tcp) return 0;
+#if defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
     return LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+#else
+    // Built against a pre-v4 header that has no network rights at all. The
+    // runtime probe cannot report has_net_tcp on such a kernel, but the
+    // COMPILER still has to see a valid expression -- so this branch exists
+    // for the build, not for execution. T3 is refused, not degraded.
+    return 0;
+#endif
 }
 
 std::uint16_t parse_port(std::string_view host_port) {

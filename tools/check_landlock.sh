@@ -153,12 +153,23 @@ int main() {
 }
 EOF
 
-c++ -std=c++23 -Wall -Wextra -Wno-unused-function \
+# Pick a C++23 flag this compiler actually accepts. Apple clang on macos-14
+# rejects `-std=c++23` outright ("invalid value 'c++23'") but takes the older
+# spelling `c++2b` for the same standard -- MEASURED: this job failed on every
+# push for days with `error: invalid value 'c++23' in '-std=c++23'`, which
+# looked like a code error and was a flag-spelling error.
+STD=c++2b
+if echo 'int main(){}' | c++ -std=c++23 -fsyntax-only -x c++ - 2>/dev/null; then
+    STD=c++23
+fi
+echo "using -std=$STD"
+
+c++ -std=$STD -Wall -Wextra -Wno-unused-function \
     -I"$FAKE" -fsyntax-only "$FAKE/tu.cpp"
 echo "OK: UAPI struct layout, field names and syscall usage verified"
 
 # Also confirm the backend itself still parses on the host (fallback branch).
-c++ -std=c++23 -Wall -Wextra -I"$ROOT/include" \
+c++ -std=$STD -Wall -Wextra -I"$ROOT/include" \
     -fsyntax-only "$ROOT/src/backend/landlock.cpp"
 echo "OK: landlock.cpp parses clean on host"
 
@@ -229,6 +240,64 @@ else
 fi
 
 rm -rf "$FAKE"
+
+# ---------------------------------------------------------------------------
+# DOES IT STILL BUILD ON AN OLD DISTRO?
+#
+# The runtime ABI gates (abi.has_refer and friends) are `if`s, not `#if`s, so
+# they say nothing about whether the file COMPILES where a constant is missing.
+# MEASURED: the older-ABI CI job failed for days with
+#   error: 'LANDLOCK_ACCESS_FS_REFER' was not declared in this scope
+# because Ubuntu 22.04 ships the v1 header. Developing on ABI v10 hides this
+# completely, and abi_matrix_test cannot see it -- that test proves the runtime
+# LOGIC degrades, using the headers of whatever machine it was built on.
+#
+# So: compile the backend against a synthetic v1 header. This is a real
+# compile, not a grep, and it fails the build the way the distro would.
+if [ "$(uname -s)" = "Linux" ]; then
+  OLD=$(mktemp -d)
+  mkdir -p "$OLD/linux"
+  cat > "$OLD/linux/landlock.h" <<'EOF'
+/* Synthetic Landlock ABI v1 UAPI header -- what Ubuntu 22.04 ships.
+ * v1 filesystem rights only: no REFER (v2), TRUNCATE (v3), IOCTL_DEV (v5),
+ * and no networking (v4) -- neither the constants NOR the struct members. */
+#ifndef _LINUX_LANDLOCK_H
+#define _LINUX_LANDLOCK_H
+#include <linux/types.h>
+struct landlock_ruleset_attr { __u64 handled_access_fs; };
+#define LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
+enum landlock_rule_type { LANDLOCK_RULE_PATH_BENEATH = 1 };
+struct landlock_path_beneath_attr {
+	__u64 allowed_access;
+	__s32 parent_fd;
+} __attribute__((packed));
+#define LANDLOCK_ACCESS_FS_EXECUTE     (1ULL << 0)
+#define LANDLOCK_ACCESS_FS_WRITE_FILE  (1ULL << 1)
+#define LANDLOCK_ACCESS_FS_READ_FILE   (1ULL << 2)
+#define LANDLOCK_ACCESS_FS_READ_DIR    (1ULL << 3)
+#define LANDLOCK_ACCESS_FS_REMOVE_DIR  (1ULL << 4)
+#define LANDLOCK_ACCESS_FS_REMOVE_FILE (1ULL << 5)
+#define LANDLOCK_ACCESS_FS_MAKE_CHAR   (1ULL << 6)
+#define LANDLOCK_ACCESS_FS_MAKE_DIR    (1ULL << 7)
+#define LANDLOCK_ACCESS_FS_MAKE_REG    (1ULL << 8)
+#define LANDLOCK_ACCESS_FS_MAKE_SOCK   (1ULL << 9)
+#define LANDLOCK_ACCESS_FS_MAKE_FIFO   (1ULL << 10)
+#define LANDLOCK_ACCESS_FS_MAKE_BLOCK  (1ULL << 11)
+#define LANDLOCK_ACCESS_FS_MAKE_SYM    (1ULL << 12)
+#endif
+EOF
+  if c++ -std=$STD -Wall -Wextra -Werror -I"$ROOT/include" -I"$OLD" \
+         -fsyntax-only "$ROOT/src/backend/landlock.cpp" 2>/tmp/bastion-oldhdr.log; then
+    echo "OK: backend still compiles against a Landlock ABI v1 header"
+  else
+    echo "FAIL: backend does NOT compile against an old Landlock header"
+    echo "      (this is what Ubuntu 22.04 and other LTS distros ship)"
+    head -20 /tmp/bastion-oldhdr.log
+    fail=1
+  fi
+  rm -rf "$OLD"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "FAILED: Linux spawn path is out of sync with the Landlock backend"
   exit 1

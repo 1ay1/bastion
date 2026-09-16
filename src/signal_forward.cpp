@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <iterator>
