@@ -10,6 +10,7 @@
 #pragma once
 
 #include "bastion/policy.hpp"
+#include "bastion/result.hpp"
 #include "bastion/tier.hpp"
 
 #include <cstdint>
@@ -34,11 +35,17 @@ namespace bastion::darwin {
 // Returns an error string, or empty if acceptable.
 [[nodiscard]] std::string validate_path(std::string_view path);
 
+// A SUCCESSFULLY compiled profile.
+//
+// No `ok` flag and no `error`: a CompileResult that exists is one that
+// compiled, exactly as for the Landlock Ruleset and for PolicyFile. Failure
+// travels in Result<CompileResult>, so a caller cannot reach a half-built
+// profile and hand it to sandbox_init(3) -- which, for a profile assembled
+// from attacker-influenceable path text, is the difference between a boundary
+// and a broken string.
 struct CompileResult {
     std::string profile;                 // SBPL text
     std::vector<std::string> warnings;   // rights the backend cannot enforce
-    bool ok = false;
-    std::string error;
 };
 
 // Compile a sealed policy to SBPL.
@@ -54,8 +61,8 @@ struct CompileResult {
 //   - `literal` does NOT grant children; directory grants must use `subpath`.
 //   - traversal needs `file-read-metadata`: a rule naming a canonical path is
 //     EPERM when opened via a symlink without it (DESIGN.md §2.1).
-[[nodiscard]] CompileResult compile(const Sealed& policy,
-                                    std::uint16_t proxy_port = 0);
+[[nodiscard]] Result<CompileResult> compile(const Sealed& policy,
+                                            std::uint16_t proxy_port = 0);
 
 // Apply the policy to the CURRENT process. Irreversible.
 // Returns empty on success, else an error message.

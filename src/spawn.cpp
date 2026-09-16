@@ -257,11 +257,13 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
 #endif
 
 #if defined(__APPLE__)
-    auto compiled = darwin::compile(policy, proxy_port);
-    if (!compiled.ok) {
-        out.error = "policy compilation failed: " + compiled.error;
+    auto compiled_r = darwin::compile(policy, proxy_port);
+    if (!compiled_r) {
+        out.error = "policy compilation failed: " + compiled_r.error();
         return out;  // fail closed: never launch with a broken policy
     }
+    // Only reachable on success, so the profile really compiled.
+    const darwin::CompileResult compiled = std::move(compiled_r).value();
     out.profile = compiled.profile;
     out.warnings = compiled.warnings;
 
@@ -287,18 +289,24 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // here and re-compiled inside the child, so this copy silently lacked the
     // T3 broker port rule; now that the child uses this exact ruleset, the
     // port must be baked in or T3 would deny its own broker.
-    linux_ll::Ruleset ll_rules = linux_ll::compile(policy, ll_abi, proxy_port);
+    auto ll_compiled = linux_ll::compile(policy, ll_abi, proxy_port);
+    if (!ll_compiled && policy.tier() >= Tier::Kernel && !policy.is_unconfined()) {
+        out.error = "ruleset compilation failed: " + ll_compiled.error();
+        return out;  // fail closed
+    }
     // Only the TRIVIALLY COPYABLE half crosses into the child. ll_abi carries a
     // std::string note, and touching that in the child could deadlock on the
     // allocator -- forksafe.hpp turns that mistake into a compile error.
     const linux_ll::AbiCore ll_core = ll_abi.core();
-    bool ll_ready = ll_rules.ok && !policy.is_unconfined();
+
+    // An empty Ruleset stands in when compilation failed at a tier that
+    // tolerates it (T0/T1). ll_ready gates the child, so it is never enforced.
+    // NOTE: read ok() BEFORE moving out of the Result -- reading it after would
+    // be querying a moved-from object.
+    const bool ll_ready = ll_compiled.ok() && !policy.is_unconfined();
+    const linux_ll::Ruleset ll_rules =
+        ll_compiled ? std::move(ll_compiled).value() : linux_ll::Ruleset{};
     {
-        if (!ll_rules.ok && policy.tier() >= Tier::Kernel &&
-            !policy.is_unconfined()) {
-            out.error = "ruleset compilation failed: " + ll_rules.error;
-            return out;
-        }
         out.warnings = ll_rules.warnings;
         out.profile = "landlock: " + ll_abi.note + ", " +
                       std::to_string(ll_rules.paths.size()) + " path rule(s), " +

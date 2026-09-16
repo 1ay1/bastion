@@ -187,17 +187,18 @@ AbiInfo probe_abi() {
     return info;
 }
 
-Ruleset compile(const Sealed& policy, const AbiInfo& abi, std::uint16_t proxy_port) {
+Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
+                        std::uint16_t proxy_port) {
     Ruleset rs;
     if (abi.version < 0) {
-        rs.error = abi.note;
-        return rs;
+        // No usable Landlock: return the reason, never a half-built ruleset
+        // that a caller could hand to the kernel.
+        return Error{abi.note};
     }
 
     // Unconfined: no ruleset at all. The audit ledger still records everything
     // (DESIGN.md §1) -- we decline to *enforce*, not to observe.
     if (policy.is_unconfined()) {
-        rs.ok = true;
         rs.warnings.emplace_back(
             "unconfined: no Landlock ruleset applied; operations are still "
             "recorded");
@@ -409,11 +410,13 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi, std::uint16_t proxy_po
     // cannot open its own socket and must go through the allowlist.
     if (t3_broker) {
         if (!abi.has_net_tcp) {
-            rs.error =
+            // Fail closed: T3 must not silently degrade to T2. Returning an
+            // Error rather than a flagged Ruleset means no caller can proceed
+            // to enforce this.
+            return Error{
                 "T3 brokered egress needs Landlock ABI v4+ (kernel 6.7) to pin "
                 "outbound to the broker port; this kernel is " + abi.note +
-                ". Refusing to claim per-host filtering it cannot enforce.";
-            return rs;  // fail closed: T3 must not silently degrade to T2
+                ". Refusing to claim per-host filtering it cannot enforce."};
         }
         Ruleset::PortRule pr;
         pr.port = proxy_port;
@@ -431,7 +434,6 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi, std::uint16_t proxy_po
         rs.ports.clear();
     }
 
-    rs.ok = true;
     return rs;
 }
 
@@ -556,14 +558,16 @@ std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
     AbiInfo abi = probe_abi();
     if (abi.version < 0) return abi.note;
 
-    Ruleset rs = compile(policy, abi, proxy_port);
-    if (!rs.ok) return "ruleset compilation failed: " + rs.error;
+    auto compiled = compile(policy, abi, proxy_port);
+    if (!compiled) return "ruleset compilation failed: " + compiled.error();
     if (policy.is_unconfined()) return {};  // nothing to enforce, by design
 
     const char* err = nullptr;
     // Safe to mint here: apply() is the single-threaded, allocating entry
     // point, so it is standing in for a child that has already forked.
-    if (apply_compiled(ForkBoundary::in_child(), rs, abi, &err)) return {};
+    if (apply_compiled(ForkBoundary::in_child(), compiled.value(), abi, &err)) {
+        return {};
+    }
     // Allocation is fine here: this overload is for single-threaded callers.
     return std::string{err ? err : "landlock apply failed"} + ": " +
            std::strerror(errno);

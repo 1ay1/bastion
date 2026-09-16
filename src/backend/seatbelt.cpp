@@ -58,7 +58,7 @@ std::string validate_path(std::string_view path) {
     return {};
 }
 
-CompileResult compile(const Sealed& policy, std::uint16_t proxy_port) {
+Result<CompileResult> compile(const Sealed& policy, std::uint16_t proxy_port) {
     CompileResult res;
     std::ostringstream o;
 
@@ -74,7 +74,6 @@ CompileResult compile(const Sealed& policy, std::uint16_t proxy_port) {
         o << ";; T0 OBSERVE: no enforcement, full reporting.\n"
           << "(allow default (with report))\n";
         res.profile = o.str();
-        res.ok = true;
         res.warnings.emplace_back(
             "T0 observe: nothing is enforced; every access is recorded");
         return res;
@@ -87,7 +86,6 @@ CompileResult compile(const Sealed& policy, std::uint16_t proxy_port) {
         o << ";; UNCONFINED grant active -- auditing remains in force.\n"
           << "(allow default)\n";
         res.profile = o.str();
-        res.ok = true;
         res.warnings.emplace_back(
             "unconfined: no filesystem or network restriction is enforced; "
             "operations are still recorded");
@@ -201,8 +199,9 @@ CompileResult compile(const Sealed& policy, std::uint16_t proxy_port) {
         if (auto err = validate_path(r.scope); !err.empty() &&
                                                r.right != Right::NetEgress &&
                                                r.right != Right::NetBind) {
-            res.error = "rule rejected: " + err;
-            return res;  // fail closed
+            // Fail closed: a path we cannot validate must never be
+            // silently dropped from the profile.
+            return Error{"rule rejected: " + err};
         }
 
         const std::string esc = sbpl_escape(r.scope);
@@ -261,7 +260,6 @@ CompileResult compile(const Sealed& policy, std::uint16_t proxy_port) {
     }
 
     res.profile = o.str();
-    res.ok = true;
     return res;
 }
 
@@ -270,10 +268,10 @@ std::string apply(const Sealed& policy) {
         return "sandbox_init unavailable on this system";
     }
     auto compiled = compile(policy);
-    if (!compiled.ok) return "profile compilation failed: " + compiled.error;
+    if (!compiled) return "profile compilation failed: " + compiled.error();
 
     char* err = nullptr;
-    if (sandbox_init(compiled.profile.c_str(), 0, &err) != 0) {
+    if (sandbox_init(compiled.value().profile.c_str(), 0, &err) != 0) {
         std::string msg = err ? err : "unknown sandbox_init failure";
         if (err && &sandbox_free_error != nullptr) sandbox_free_error(err);
         return "sandbox_init failed: " + msg;

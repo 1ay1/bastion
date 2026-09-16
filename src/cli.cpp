@@ -418,13 +418,31 @@ int cmd_explain(const Args& a) {
 
 #if defined(__APPLE__)
     auto compiled = darwin::compile(policy);
-    for (const auto& w : compiled.warnings) {
+    if (!compiled) {
+        // Same reasoning as the Linux branch: a policy the kernel cannot
+        // express is the most important thing `explain` can report.
+        std::printf("\n[ERROR] this policy cannot be enforced on this system:\n"
+                    "        %s\n", compiled.error().c_str());
+        return 1;
+    }
+    for (const auto& w : compiled.value().warnings) {
         std::printf("\n[warning] %s\n", w.c_str());
     }
 #elif defined(__linux__)
     auto abi = linux_ll::probe_abi();
     auto rs = linux_ll::compile(policy, abi);
-    for (const auto& w : rs.warnings) std::printf("\n[warning] %s\n", w.c_str());
+    if (!rs) {
+        // `explain` exists to tell the user what the boundary REALLY is, so a
+        // policy the kernel cannot express is the single most important thing
+        // it can report. The previous code read .warnings off the result and
+        // silently ignored the failure.
+        std::printf("\n[ERROR] this policy cannot be enforced on this kernel:\n"
+                    "        %s\n", rs.error().c_str());
+        return 1;
+    }
+    for (const auto& w : rs.value().warnings) {
+        std::printf("\n[warning] %s\n", w.c_str());
+    }
 #endif
     return 0;
 }

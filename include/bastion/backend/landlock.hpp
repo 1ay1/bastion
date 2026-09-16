@@ -16,6 +16,7 @@
 
 #include "bastion/forksafe.hpp"
 #include "bastion/policy.hpp"
+#include "bastion/result.hpp"
 #include "bastion/tier.hpp"
 
 #include <cstdint>
@@ -80,6 +81,17 @@ struct AbiInfo : AbiCore {
 // the child agree on which directory the toolchain should use.
 [[nodiscard]] const std::string& private_tmp_dir();
 
+// A SUCCESSFULLY compiled ruleset, ready to hand to the kernel.
+//
+// No `ok` flag and no `error` field, for the same reason PolicyFile has none:
+// a Ruleset that exists is one that compiled. Failure travels in
+// Result<Ruleset> instead.
+//
+// This is the ENFORCEMENT path, so the stakes are higher than for the parser.
+// apply_compiled() previously took a Ruleset and never checked `ok` -- callers
+// checked it by convention. A caller that forgot would hand the kernel a
+// half-built ruleset and enforce it: paths silently missing, and the workload
+// confined by something nobody authorised. Now that call cannot be written.
 struct Ruleset {
     std::uint64_t handled_fs = 0;    // clamped to the probed ABI
     std::uint64_t handled_net = 0;
@@ -95,8 +107,6 @@ struct Ruleset {
     };
     std::vector<PortRule> ports;
     std::vector<std::string> warnings;
-    bool ok = false;
-    std::string error;
 };
 
 // Translate a Sealed policy into a Landlock ruleset for THIS kernel.
@@ -106,8 +116,8 @@ struct Ruleset {
 // bastion's broker enforces the per-host allowlist there (see proxy.hpp).
 // Requires ABI v4+; on older kernels network rules cannot be mediated at all
 // and compile() says so in `warnings` rather than pretending.
-[[nodiscard]] Ruleset compile(const Sealed& policy, const AbiInfo& abi,
-                              std::uint16_t proxy_port = 0);
+[[nodiscard]] Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
+                                      std::uint16_t proxy_port = 0);
 
 // Apply to the current thread and its future children. Irreversible.
 // Must be called after fork() and before exec(); returns empty on success.
