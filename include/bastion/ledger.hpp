@@ -53,6 +53,23 @@ struct SynthesisOptions {
     // policy readable instead of emitting a rule per file.
     std::size_t coalesce_threshold = 3;
 
+    // Synthesize from the LAST observed session only, not the whole file.
+    //
+    // The ledger is append-only and shared across every run, so without this a
+    // policy accumulates everything the agent has ever touched. MEASURED: two
+    // unrelated tasks in one directory produced a policy granting BOTH tasks'
+    // files, and 30 `observe` runs left 1020 records behind. Over a long
+    // session the derived policy widens monotonically toward --yolo, which
+    // inverts the point of deriving it.
+    //
+    // A session is delimited by the `proc.spawn` record every run writes, so
+    // "the last session" is the last workload observed -- which is what a user
+    // running `bastion observe -- <cmd> && bastion synthesize` means.
+    //
+    // Set false to mine the full history deliberately, e.g. to build one
+    // policy covering a whole suite of tasks.
+    bool last_session_only = true;
+
     // Never widen a grant to one of these, even if the evidence suggests it.
     // A synthesized policy must not casually hand over $HOME or /.
     std::vector<std::string> never_widen_to = {
@@ -67,6 +84,7 @@ struct Synthesis {
     std::size_t observations = 0;
     std::size_t denials_seen = 0;
     std::size_t floor_filtered = 0;  // accesses the ergonomic floor covers
+    std::size_t sessions_skipped = 0;  // earlier runs deliberately ignored
 
     // Render as a policy file the user can review, edit and commit.
     [[nodiscard]] std::string to_toml() const;

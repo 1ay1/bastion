@@ -957,6 +957,23 @@ int cmd_observe(const Args& a) {
 
     if (!a.no_ledger) {
         Ledger led{a.ledger};
+
+        // A session boundary, written BEFORE the observed accesses.
+        //
+        // The ledger is append-only and shared across runs, so without a
+        // delimiter `synthesize` cannot tell this observation from every
+        // earlier one -- MEASURED: two unrelated tasks produced a policy
+        // granting both tasks' files. `run` already writes a proc.spawn
+        // record; `observe` did not, so its output was indistinguishable from
+        // the previous session's.
+        AuditRecord start;
+        start.verdict = Verdict::Allow;
+        start.op = "proc.spawn";
+        start.target = a.argv.front();
+        start.tier = Tier::Observe;
+        start.rule = "observed";
+        led.record(start);
+
         for (const auto& r : res.records) led.record(r);
         if (auto err = led.flush(); !err.empty()) {
             std::fprintf(stderr, "bastion: [warning] ledger: %s\n", err.c_str());

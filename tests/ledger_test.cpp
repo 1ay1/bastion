@@ -271,6 +271,60 @@ int main() {
               "...while a genuine read is still granted");
     }
 
+    std::puts("\n== synthesis is scoped to the LAST run ==");
+    {
+        // The ledger is append-only and shared by every run, so mining all of
+        // it produces a policy covering everything the agent has ever done.
+        // MEASURED: two unrelated tasks in one directory yielded a policy
+        // granting BOTH tasks' files. Over a long session the grant set widens
+        // monotonically -- arriving at --yolo by accretion, which inverts the
+        // point of deriving a policy.
+        Ledger led5{"/tmp/bastion-ledger-test/l5.jsonl"};
+        const std::string dir = "/tmp/bastion-ledger-test/sess";
+        fs::create_directories(dir);
+        std::ofstream{dir + "/old.txt"} << "old\n";
+        std::ofstream{dir + "/new.txt"} << "new\n";
+
+        auto spawn_marker = [&](const char* what) {
+            AuditRecord r;
+            r.verdict = Verdict::Allow;
+            r.op = "proc.spawn";
+            r.target = what;
+            led5.record(r);
+        };
+        auto read_of = [&](const std::string& t) {
+            AuditRecord r;
+            r.verdict = Verdict::Allow;
+            r.op = "fs.read";
+            r.target = t;
+            led5.record(r);
+        };
+
+        spawn_marker("task-one");
+        read_of(dir + "/old.txt");
+        spawn_marker("task-two");
+        read_of(dir + "/new.txt");
+
+        const auto s5 = synthesize(led5);
+        const std::string t5 = s5.to_toml();
+
+        check(has(t5, "new.txt"), "the most recent run's access is granted");
+        check(!has(t5, "old.txt"),
+              "an EARLIER run's access is not silently carried forward");
+        check(s5.sessions_skipped == 1, "the skipped run is counted");
+        // Scoping must be visible, or a user wonders where their earlier work
+        // went and reaches for a wider policy to "fix" it.
+        check(has(t5, "Scoped to the LAST run"),
+              "...and the narrowing is stated in the output");
+
+        // Opting out must still work, for building one policy across a suite.
+        SynthesisOptions all_opts;
+        all_opts.last_session_only = false;
+        const std::string t5all = synthesize(led5, all_opts).to_toml();
+        check(has(t5all, "old.txt") && has(t5all, "new.txt"),
+              "last_session_only=false still mines the whole history");
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "all ledger tests passed" : "FAILURES",
                 failures, failures == 1 ? "" : "s");

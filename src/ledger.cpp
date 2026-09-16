@@ -224,7 +224,34 @@ Synthesis synthesize(const Ledger& ledger, const SynthesisOptions& opts) {
     // right -> set of concrete targets observed needing it
     std::map<std::uint32_t, std::set<std::string>> need;
 
-    for (const auto& r : ledger.records()) {
+    // SESSION SCOPING. The ledger is append-only and shared by every run, so
+    // mining all of it produces a policy covering everything the agent has
+    // ever done. MEASURED: two unrelated tasks in one directory yielded a
+    // policy granting BOTH tasks' files, and the grant set widens
+    // monotonically as a session goes on -- ending up at --yolo by accretion,
+    // which inverts the point of deriving a policy at all.
+    //
+    // Each run writes a `proc.spawn` record first, so the last one marks the
+    // start of the most recent session. That is what a user means by
+    // `bastion observe -- <cmd> && bastion synthesize`.
+    const auto& all = ledger.records();
+    std::size_t begin = 0;
+    if (opts.last_session_only) {
+        for (std::size_t i = all.size(); i-- > 0;) {
+            if (all[i].op == "proc.spawn") {
+                begin = i;
+                break;
+            }
+        }
+        // Count the runs being ignored, so the output can SAY it is scoped
+        // rather than leaving the user wondering where their earlier work went.
+        for (std::size_t i = 0; i < begin; ++i) {
+            if (all[i].op == "proc.spawn") ++syn.sessions_skipped;
+        }
+    }
+
+    for (std::size_t i = begin; i < all.size(); ++i) {
+        const auto& r = all[i];
         ++syn.observations;
         if (r.verdict == Verdict::Deny) {
             ++syn.denials_seen;
@@ -413,6 +440,14 @@ std::string Synthesis::to_toml() const {
         o << "# " << floor_filtered
           << " access(es) omitted: already covered by the ergonomic floor\n"
           << "# (dyld, locale data, /bin, /dev/null, traversal metadata, ...).\n";
+    }
+    if (sessions_skipped > 0) {
+        o << "# Scoped to the LAST run; " << sessions_skipped
+          << " earlier run(s) in this ledger were ignored.\n"
+          << "# The ledger is append-only, so mining all of it would grant "
+          << "everything the\n"
+          << "# agent has ever touched. Use a fresh --ledger to widen the "
+          << "scope deliberately.\n";
     }
     o << "# This is the MINIMAL policy that would have allowed everything the\n"
       << "# program actually did. Review before committing.\n\n";
