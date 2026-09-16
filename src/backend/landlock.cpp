@@ -145,7 +145,7 @@ const std::string& private_tmp_dir() {
     return dir;
 }
 
-std::size_t AbiInfo::ruleset_attr_size() const noexcept {
+std::size_t AbiCore::ruleset_attr_size() const noexcept {
     // Field growth by ABI version (each field is __u64):
     //   v1-v3 : handled_access_fs             (1 field)
     //   v4+   : + handled_access_net          (2 fields)
@@ -435,13 +435,20 @@ Ruleset compile(const Sealed& policy, const AbiInfo& abi, std::uint16_t proxy_po
     return rs;
 }
 
-std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
-    AbiInfo abi = probe_abi();
-    if (abi.version < 0) return abi.note;
+bool apply_compiled(ForkChild tok, const Ruleset& rs, const AbiCore& abi,
+                    const char** err) noexcept {
+    // The token carries no runtime state: its whole job is to make the
+    // "only callable in a post-fork child" contract checkable by the compiler.
+    (void)tok;
+    const auto setf = [err](const char* m) { if (err) *err = m; };
+    setf(nullptr);
 
-    Ruleset rs = compile(policy, abi, proxy_port);
-    if (!rs.ok) return "ruleset compilation failed: " + rs.error;
-    if (policy.is_unconfined()) return {};  // nothing to enforce, by design
+    // ASYNC-SIGNAL-SAFE FROM HERE DOWN, and now machine-checked rather than
+    // merely asserted in a comment: `tok` proves we are in a post-fork child,
+    // and ForkChild::check() makes using a non-trivially-copyable value here a
+    // COMPILE error. The values we cross the boundary with are the ABI struct
+    // (trivial) and raw const char* into strings the PARENT already built.
+    ForkChild::check(abi);
 
     // NO_NEW_PRIVS is mandatory: landlock_restrict_self fails with EPERM
     // without it for an unprivileged process. It also independently prevents
@@ -449,8 +456,8 @@ std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
     // the exact class of hole that makes firejail's setuid-root design unsafe
     // (DESIGN.md §3.1).
     if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-        return std::string{"prctl(PR_SET_NO_NEW_PRIVS) failed: "} +
-               std::strerror(errno);
+        setf("prctl(PR_SET_NO_NEW_PRIVS) failed");
+        return false;
     }
 
     struct landlock_ruleset_attr attr {};
@@ -459,15 +466,16 @@ std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
     attr.handled_access_net = rs.handled_net;
 #  endif
 
-    // Pass the ABI-appropriate size, not sizeof() (see AbiInfo::ruleset_attr_size).
-    int fd = ll_create_ruleset(&attr, abi.ruleset_attr_size(), 0);
+    // Pass the ABI-appropriate size, not sizeof() (see ruleset_attr_size).
+    const int fd = ll_create_ruleset(&attr, abi.ruleset_attr_size(), 0);
     if (fd < 0) {
-        return std::string{"landlock_create_ruleset failed: "} +
-               std::strerror(errno);
+        setf("landlock_create_ruleset failed");
+        return false;
     }
 
     for (const auto& p : rs.paths) {
-        int pfd = ::open(p.path.c_str(), O_PATH | O_CLOEXEC);
+        // p.path is a std::string built by the PARENT; .c_str() only reads it.
+        const int pfd = ::open(p.path.c_str(), O_PATH | O_CLOEXEC);
         if (pfd < 0) continue;  // vanished between compile and apply; skip
 
         // Mask to the handled set: a rule may not grant a right the ruleset
@@ -497,12 +505,12 @@ std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
         struct landlock_path_beneath_attr pb {};
         pb.parent_fd = pfd;
         pb.allowed_access = allowed;
-        int rc = ll_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
+        const int rc = ll_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
         ::close(pfd);
         if (rc != 0) {
             ::close(fd);
-            return "landlock_add_rule failed for " + p.path + ": " +
-                   std::strerror(errno);
+            setf("landlock_add_rule(path) failed");
+            return false;
         }
     }
 
@@ -529,17 +537,36 @@ std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
         if (np.allowed_access == 0) continue;
         if (ll_add_rule(fd, LANDLOCK_RULE_NET_PORT, &np, 0) != 0) {
             ::close(fd);
-            return "landlock_add_rule(net) failed: " + std::string{std::strerror(errno)};
+            setf("landlock_add_rule(net) failed");
+            return false;
         }
     }
 #  endif
 
     if (ll_restrict_self(fd, 0) != 0) {
         ::close(fd);
-        return std::string{"landlock_restrict_self failed: "} + std::strerror(errno);
+        setf("landlock_restrict_self failed");
+        return false;
     }
     ::close(fd);
-    return {};
+    return true;
+}
+
+std::string apply(const Sealed& policy, std::uint16_t proxy_port) {
+    AbiInfo abi = probe_abi();
+    if (abi.version < 0) return abi.note;
+
+    Ruleset rs = compile(policy, abi, proxy_port);
+    if (!rs.ok) return "ruleset compilation failed: " + rs.error;
+    if (policy.is_unconfined()) return {};  // nothing to enforce, by design
+
+    const char* err = nullptr;
+    // Safe to mint here: apply() is the single-threaded, allocating entry
+    // point, so it is standing in for a child that has already forked.
+    if (apply_compiled(ForkBoundary::in_child(), rs, abi, &err)) return {};
+    // Allocation is fine here: this overload is for single-threaded callers.
+    return std::string{err ? err : "landlock apply failed"} + ": " +
+           std::strerror(errno);
 }
 
 BackendCaps probe() {
@@ -582,7 +609,7 @@ AbiInfo probe_abi() {
     return i;
 }
 
-std::size_t AbiInfo::ruleset_attr_size() const noexcept { return 0; }
+std::size_t AbiCore::ruleset_attr_size() const noexcept { return 0; }
 
 Ruleset compile(const Sealed&, const AbiInfo& abi, std::uint16_t) {
     Ruleset rs;

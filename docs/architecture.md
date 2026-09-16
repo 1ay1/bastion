@@ -144,9 +144,12 @@ was corrected.
 ```
 fork()
   ├─ chdir()                 cwd must be reachable, and granted
+  ├─ join cgroup             child writes its OWN pid: race-free
+  ├─ setrlimit()             ceilings bound the sandbox setup too
   ├─ setpgid(0,0)            own process group → T0 attribution
   ├─ close_inherited_fds()   MEASURED escape (below)
-  ├─ apply(policy)           irreversible; failure ⇒ _exit(126)
+  ├─ enter_namespaces()      T3 only; before Landlock, which freezes mounts
+  ├─ apply_compiled()        irreversible; failure ⇒ _exit(126)
   └─ execve()
 ```
 
@@ -154,6 +157,55 @@ Confinement must land **after** `fork` (applying it in the parent would confine
 bastion itself) and **before** `exec` (afterwards is impossible). If `apply`
 fails the child `_exit`s with a distinguished code rather than exec'ing — a
 failed sandbox must never degrade to no sandbox.
+
+### Async-signal-safety is a type, not a comment
+
+Everything in that child block runs between `fork()` and `execve()`, where only
+async-signal-safe calls are legal. If another thread held the malloc lock at the
+instant of `fork`, that lock is held **forever** in the child, so the first
+allocation deadlocks — the child hangs with the sandbox unapplied and the
+workload never exec'd. Silent, unkillable, and in the one path that must never
+fail open.
+
+This is not theoretical here: at T3 the egress broker's accept thread is already
+running when bastion forks. **bastion forks from a multithreaded process.**
+
+The rule used to be a comment — *"only async-signal-safe calls past this
+point"* — and that comment was already wrong: the child called
+`linux_ll::apply()`, which builds `std::string`s. Nothing checked, so the bug
+would have surfaced as an intermittent hang under load, not a test failure.
+
+So fork-safety is now enforced the same way privilege is (§3): make the unsafe
+program *ill-formed*.
+
+```cpp
+// include/bastion/forksafe.hpp
+template <class T>
+concept ForkSafe = std::is_trivially_copyable_v<std::remove_cvref_t<T>>;
+
+[[nodiscard]] bool apply_compiled(ForkChild tok, const Ruleset&,
+                                  const AbiCore&, const char** err) noexcept;
+```
+
+- `ForkChild` is **unforgeable** (private constructor, one friend), exactly like
+  `Cap<R>`. Only the code that forks can mint one, so a post-fork-only API
+  cannot be called from ordinary code by accident.
+- `AbiInfo` was **split**. It carried a `std::string note`, so passing it to the
+  child was an allocation waiting to happen; the trivially-copyable `AbiCore`
+  crosses the boundary and the string stays in the parent. The compiler found
+  this — it was not noticed by review.
+- The `Ruleset` is compiled in the **parent** and only *read* in the child. A
+  `const char*` into parent memory is fork-safe (it is copy-on-write); building
+  a new `std::string` is not.
+
+Five negative-compile tests assert each unsafe shape is rejected, including the
+exact shape of the original bug. As with the capability tests: a "this is a
+compile error" claim is worthless unless something verifies that it really is.
+
+The type system cannot see *every* allocation — nothing short of a custom
+allocator could. What it gives is a machine-checked contract at the boundary,
+which turns the most dangerous case (passing a string-shaped thing into
+post-fork code) from a review question into a compiler error.
 
 **`close_inherited_fds()` closes a real escape.** On both Seatbelt and Landlock,
 access rights attach to the *open file description*, not the path. A descriptor

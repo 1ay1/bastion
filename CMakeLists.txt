@@ -141,4 +141,22 @@ if(BASTION_BUILD_TESTS)
                          -DCASE=${case}
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
     endforeach()
+
+    # Fork-safety: async-signal-safety enforced by the TYPE SYSTEM rather than
+    # by a comment. The comment was already wrong once -- the child called an
+    # allocating apply(), which can deadlock forever on a malloc lock held by a
+    # thread that does not exist in the child.
+    add_executable(forksafe_test tests/forksafe_test.cpp)
+    target_link_libraries(forksafe_test PRIVATE bastion)
+    add_test(NAME forksafe COMMAND forksafe_test)
+
+    foreach(case 1 2 3 4 5)
+        add_test(NAME forksafe_negative_${case}
+                 COMMAND ${CMAKE_COMMAND}
+                         -DTEST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+                         -DCASE=${case}
+                         -DFILE=tests/forksafe_test.cpp
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
+    endforeach()
 endif()

@@ -186,7 +186,25 @@ check_decl() {
 check_decl "spawn.cpp includes the Landlock backend on Linux" \
   "$ROOT/src/spawn.cpp" 'elif defined\(__linux__\)'
 check_decl "spawn.cpp applies Landlock in the child" \
-  "$ROOT/src/spawn.cpp" 'linux_ll::apply\(policy, proxy_port\)'
+  "$ROOT/src/spawn.cpp" 'linux_ll::apply_compiled\('
+check_decl "child proves fork-safety with a ForkChild token" \
+  "$ROOT/src/spawn.cpp" 'ForkBoundary::in_child\(\)'
+check_decl "child crosses the fork boundary with the TRIVIAL AbiCore" \
+  "$ROOT/src/spawn.cpp" 'll_core'
+check_decl "spawn.cpp pre-compiles the ruleset in the PARENT" \
+  "$ROOT/src/spawn.cpp" 'linux_ll::compile\(policy, ll_abi, proxy_port\)'
+
+# The child must NOT call the allocating apply(). At T3 the egress broker's
+# accept thread is running when we fork, and a child of a multithreaded process
+# deadlocks if it takes a malloc lock another thread held at fork time -- it
+# would hang with the sandbox unapplied and the workload never exec'd.
+if grep -q 'linux_ll::apply(policy' "$ROOT/src/spawn.cpp"; then
+  echo "FAIL: child calls the ALLOCATING linux_ll::apply(); use apply_compiled()"
+  echo "      (forking from the T3 broker's thread + malloc = possible deadlock)"
+  fail=1
+else
+  echo "OK: child uses the allocation-free apply_compiled()"
+fi
 check_decl "spawn.cpp fails closed when Landlock is unavailable" \
   "$ROOT/src/spawn.cpp" 'refusing to run unconfined'
 check_decl "landlock.hpp declares apply(policy, proxy_port)" \

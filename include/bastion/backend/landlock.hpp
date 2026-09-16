@@ -14,6 +14,7 @@
 // a binary built on a new kernel must still confine correctly on an old one.
 #pragma once
 
+#include "bastion/forksafe.hpp"
 #include "bastion/policy.hpp"
 #include "bastion/tier.hpp"
 
@@ -32,7 +33,16 @@ namespace bastion::linux_ll {
 //   v6  (6.12) scoped abstract-unix/signal
 //   v9         FS_RESOLVE_UNIX
 //   v10        UDP rights + quiet_* fields; RESTRICT_SELF_NO_NEW_PRIVS
-struct AbiInfo {
+// The kernel-facing half of AbiInfo: version numbers and feature bits only.
+//
+// Split out deliberately so it is TRIVIALLY COPYABLE and therefore usable in a
+// post-fork child (see forksafe.hpp). The parent probes once, and the child
+// carries this across the fork boundary to apply the ruleset without touching
+// the allocator. `note` lives in AbiInfo because a std::string in the child
+// could deadlock on a malloc lock held by a thread that no longer exists --
+// which ForkChild::check() now turns into a compile error rather than an
+// intermittent hang.
+struct AbiCore {
     int version = -1;              // -1 => Landlock unavailable
     bool has_refer = false;        // v2+
     bool has_truncate = false;     // v3+
@@ -40,7 +50,6 @@ struct AbiInfo {
     bool has_ioctl_dev = false;    // v5+
     bool has_scoped = false;       // v6+
     bool has_quiet = false;        // v10+
-    std::string note;
 
     // Byte size of landlock_ruleset_attr to pass for THIS kernel.
     //
@@ -50,6 +59,12 @@ struct AbiInfo {
     // "built on a new kernel, must still confine on an old one" case. So the
     // size is derived from the PROBED version, never from the headers.
     [[nodiscard]] std::size_t ruleset_attr_size() const noexcept;
+};
+
+struct AbiInfo : AbiCore {
+    std::string note;  // human-readable; NEVER crosses the fork boundary
+
+    [[nodiscard]] const AbiCore& core() const noexcept { return *this; }
 };
 
 // Query the running kernel. Never inferred from build-time headers.
@@ -99,8 +114,36 @@ struct Ruleset {
 //
 // Also sets PR_SET_NO_NEW_PRIVS, without which Landlock refuses to enforce for
 // an unprivileged process -- and which independently blocks setuid escalation.
+//
+// WARNING: this ALLOCATES (it calls compile() and builds std::strings), so it
+// is NOT async-signal-safe and must not be used in a child forked from a
+// multithreaded process. Use compile() + apply_compiled() for that; see below.
 [[nodiscard]] std::string apply(const Sealed& policy,
                                 std::uint16_t proxy_port = 0);
+
+// Enforce an ALREADY-COMPILED ruleset without allocating.
+//
+// WHY THIS EXISTS: at T3 bastion starts the egress broker, which runs an accept
+// thread, BEFORE it forks the workload. A child forked from a multithreaded
+// process may only call async-signal-safe functions: if another thread held the
+// malloc lock at the instant of fork, that lock is held forever in the child,
+// so the first allocation DEADLOCKS. The child would hang with the sandbox
+// unapplied and the workload not yet exec'd -- a silent hang in the one code
+// path that must never fail open.
+//
+// So the caller compiles in the parent (where allocation is safe) and calls
+// this in the child. It performs only syscalls: prctl, open, fstat, close, and
+// the three landlock syscalls.
+//
+// The ForkChild parameter is not decoration: it is unforgeable (only the code
+// that forks can mint one), so this function CANNOT be called outside a
+// post-fork child by accident, and its presence documents the constraint in a
+// way the compiler checks. `err` receives a STATIC string -- never allocated,
+// never formatted -- identifying which step failed.
+//
+// Returns true on success.
+[[nodiscard]] bool apply_compiled(ForkChild tok, const Ruleset& rs,
+                                  const AbiCore& abi, const char** err) noexcept;
 
 [[nodiscard]] BackendCaps probe();
 

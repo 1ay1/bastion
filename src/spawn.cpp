@@ -249,27 +249,42 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
 
 #elif defined(__linux__)
     // Landlock has no text profile; the ruleset is applied directly in the
-    // child (see below). Compile here only to surface warnings and to FAIL
-    // BEFORE forking if the kernel cannot express what was asked for.
-    const auto abi = linux_ll::probe_abi();
-    if (abi.version < 0 && policy.tier() >= Tier::Kernel &&
+    // child (see below). Compile HERE, in the parent, for two reasons:
+    //   1. fail BEFORE forking if the kernel cannot express what was asked for;
+    //   2. the child must not allocate. At T3 the egress broker's accept
+    //      thread is already running, and a child forked from a multithreaded
+    //      process deadlocks if it takes a malloc lock another thread held at
+    //      fork time. So the child gets a ready-made Ruleset and only makes
+    //      syscalls (linux_ll::apply_compiled).
+    const auto ll_abi = linux_ll::probe_abi();
+    if (ll_abi.version < 0 && policy.tier() >= Tier::Kernel &&
         !policy.is_unconfined()) {
         out.error =
             "policy requires T2 kernel enforcement but Landlock is "
-            "unavailable: " + abi.note +
+            "unavailable: " + ll_abi.note +
             " -- refusing to run unconfined";
         return out;  // fail closed
     }
+    // NOTE: compiled WITH proxy_port. An earlier version compiled without it
+    // here and re-compiled inside the child, so this copy silently lacked the
+    // T3 broker port rule; now that the child uses this exact ruleset, the
+    // port must be baked in or T3 would deny its own broker.
+    linux_ll::Ruleset ll_rules = linux_ll::compile(policy, ll_abi, proxy_port);
+    // Only the TRIVIALLY COPYABLE half crosses into the child. ll_abi carries a
+    // std::string note, and touching that in the child could deadlock on the
+    // allocator -- forksafe.hpp turns that mistake into a compile error.
+    const linux_ll::AbiCore ll_core = ll_abi.core();
+    bool ll_ready = ll_rules.ok && !policy.is_unconfined();
     {
-        auto rs = linux_ll::compile(policy, abi);
-        if (!rs.ok && policy.tier() >= Tier::Kernel && !policy.is_unconfined()) {
-            out.error = "ruleset compilation failed: " + rs.error;
+        if (!ll_rules.ok && policy.tier() >= Tier::Kernel &&
+            !policy.is_unconfined()) {
+            out.error = "ruleset compilation failed: " + ll_rules.error;
             return out;
         }
-        out.warnings = rs.warnings;
-        out.profile = "landlock: " + abi.note + ", " +
-                      std::to_string(rs.paths.size()) + " path rule(s), " +
-                      std::to_string(rs.ports.size()) + " port rule(s)";
+        out.warnings = ll_rules.warnings;
+        out.profile = "landlock: " + ll_abi.note + ", " +
+                      std::to_string(ll_rules.paths.size()) + " path rule(s), " +
+                      std::to_string(ll_rules.ports.size()) + " port rule(s)";
     }
 
 #else
@@ -442,15 +457,22 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // open, and the parent would then block forever waiting for an EOF.
     const bool pipe_ok = ::pipe2(status_pipe, O_CLOEXEC) == 0;
 #else
-    // macOS has no pipe2(2); the fcntl window is accepted (bastion does not
-    // fork from multiple threads) and is still far better than inferring
-    // confinement failure from an exit code the workload controls.
+    // macOS has no pipe2(2), so there is an unavoidable window between pipe()
+    // and fcntl() in which a concurrent fork could inherit the write end.
+    // bastion DOES fork from a multithreaded process at T3 (the egress broker
+    // runs an accept thread), but only bastion itself forks, and it does so
+    // from this one function -- so nothing else is racing these descriptors.
     const bool pipe_ok =
         ::pipe(status_pipe) == 0 &&
         ::fcntl(status_pipe[0], F_SETFD, FD_CLOEXEC) == 0 &&
         ::fcntl(status_pipe[1], F_SETFD, FD_CLOEXEC) == 0;
 #endif
     if (!pipe_ok) {
+        // Close whatever pipe() did manage to create. On the macOS path a
+        // failing fcntl() leaves BOTH ends open, so returning without this
+        // leaks two descriptors per attempt.
+        if (status_pipe[0] >= 0) ::close(status_pipe[0]);
+        if (status_pipe[1] >= 0) ::close(status_pipe[1]);
         out.error = std::string{"status pipe failed: "} + std::strerror(errno);
         return out;
     }
@@ -581,15 +603,24 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
             (void)linux_ns::enter_namespaces();
         }
 
-        // Same ordering, same fail-closed contract. linux_ll::apply() also sets
-        // PR_SET_NO_NEW_PRIVS, which Landlock requires for an unprivileged
-        // process and which independently blocks setuid escalation.
+        // Confinement lands here: after fork (so bastion stays unconfined),
+        // before exec (so the child can never run unconfined).
         //
-        // NOTE: this allocates (std::string), which is not async-signal-safe.
-        // It is acceptable only because bastion forks from a single-threaded
-        // context here; if the host ever spawns from a thread while another
-        // holds the malloc lock, this must be pre-compiled before fork().
-        if (!linux_ll::apply(policy, proxy_port).empty()) {
+        // Uses the PRE-COMPILED ruleset and an allocation-free apply: at T3
+        // the egress broker's accept thread is already running when we fork,
+        // and a child of a multithreaded process that allocates can deadlock
+        // forever on a malloc lock held by a thread that does not exist here.
+        // That would hang with the sandbox unapplied -- so compilation happens
+        // in the parent and this path performs syscalls only.
+        if (ll_ready) {
+            const char* lerr = nullptr;
+            if (!linux_ll::apply_compiled(bastion::ForkBoundary::in_child(),
+                                          ll_rules, ll_core, &lerr)) {
+                fail(ChildStage::Sandbox, kExitSandboxFailed);
+            }
+        } else if (!policy.is_unconfined()) {
+            // Compilation failed in the parent, which already recorded why.
+            // Fail closed rather than exec an unconfined workload.
             fail(ChildStage::Sandbox, kExitSandboxFailed);
         }
 #endif
