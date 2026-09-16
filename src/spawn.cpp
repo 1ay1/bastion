@@ -783,9 +783,30 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // run setpgid but the observer is already reading audit lines.
     ::setpgid(pid, pid);
 
+    // Armed HERE, not around spawn_wait(), and it stays armed for the rest of
+    // the call. Everything below -- the blocking read() on the status pipe,
+    // then the wait -- is time in which an agent harness may kill us, and a
+    // SIGTERM arriving before this point terminates bastion with the DEFAULT
+    // disposition, orphaning the child subtree.
+    //
+    // MEASURED: with the forwarder scoped to spawn_wait() only, killing
+    // bastion at T3 left SIX processes running while T2 left none. T3's child
+    // forks twice more (the namespace supervisors) before reaching execve, so
+    // it lingers in the read() above for measurably longer -- a window T2
+    // barely has. Same bug at T2, just far harder to hit.
+    const SignalForwarder forwarder{static_cast<pid_t>(out.pgid)};
+
     // Returns as soon as the child either reports a setup failure (one byte) or
     // reaches execve (EOF, because the pipe is O_CLOEXEC). This does not wait
     // on the workload -- only on bastion's own setup finishing.
+    //
+    // FORWARDING IS ALREADY ACTIVE HERE. It is armed immediately after fork(),
+    // above, rather than around spawn_wait() below, because this read() blocks
+    // and everything between fork() and it is a window in which a SIGTERM would
+    // kill bastion with the default disposition -- leaving the child subtree
+    // orphaned. MEASURED: at T3, where the child forks twice more for the
+    // namespace levels and so takes measurably longer to reach execve, killing
+    // bastion left SIX processes running while T2 left none.
     {
         unsigned char b = 0;
         ssize_t n;
@@ -801,14 +822,7 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
 
     if (!req.wait) return out;  // caller will spawn_wait() later
 
-    {
-        // Active only while we are waiting. Anything that kills bastion now --
-        // an agent harness enforcing a timeout, Ctrl-C, a closed pty -- is
-        // forwarded to the child's process group so the whole subtree dies
-        // with us instead of being orphaned. Restored on scope exit.
-        SignalForwarder forwarder{static_cast<pid_t>(out.pgid)};
-        spawn_wait(out);
-    }
+    spawn_wait(out);
 
 #if defined(__linux__)
     // Ask the KERNEL whether it refused anything, rather than leaving the user
