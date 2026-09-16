@@ -207,6 +207,39 @@ allocator could. What it gives is a machine-checked contract at the boundary,
 which turns the most dangerous case (passing a string-shaped thing into
 post-fork code) from a review question into a compiler error.
 
+### Two more invariants held by types
+
+The same reasoning applies wherever a comment was carrying a safety property.
+
+**`Result<T>` — a failure you cannot ignore.** The old shape was
+`struct { bool ok; std::string error; ... }`, which admits four states, two of
+them lies: *succeeded but carries an error*, and *failed but says nothing*.
+Worse, `to_sealed()` accepted a `PolicyFile` whose `ok` was `false`, so one
+forgotten `if` turned a **malformed policy file into a live policy**. Now
+`parse_policy` returns `Result<PolicyFile>`, the value and the error share one
+slot, and `PolicyFile` has no `ok` field at all — a `PolicyFile` that exists is
+one that parsed. The bug is no longer expressible:
+
+```cpp
+auto pf = parse_policy(text);
+auto sealed = to_sealed(pf);   // error: cannot convert Result<PolicyFile>
+                               //        to const PolicyFile&
+```
+
+**`UniqueFd` — a descriptor with exactly one owner.** Descriptors are not just
+a resource here: rights attach to the *open file description*, so a leaked fd is
+authority that outlives its scope (this is the mechanism behind the measured
+inherited-fd escape). bastion closed fds by hand in ~47 places, and an audit
+found a real leak on the macOS status-pipe path — `pipe()` succeeds, `fcntl()`
+fails, both ends leak on the early return. `UniqueFd` closes exactly once on
+every path including early returns; copying is deleted, so double-close and
+two-owners are unrepresentable. `close(2)` is async-signal-safe, so it is
+legal in the post-fork child too.
+
+Ten negative-compile tests cover the two types (unused `Result`, implicit
+unwrap, copying a descriptor, adopting a raw `int` implicitly, and the five
+fork-safety shapes).
+
 **`close_inherited_fds()` closes a real escape.** On both Seatbelt and Landlock,
 access rights attach to the *open file description*, not the path. A descriptor
 opened before confinement keeps working after it and survives `exec`:

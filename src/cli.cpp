@@ -241,13 +241,17 @@ std::optional<Sealed> build_policy(const Args& a, Broker& broker,
 
     bool from_file = false;
     if (!a.policy_file.empty()) {
-        auto pf = load_policy(a.policy_file);
-        if (!pf.ok) {
-            error = a.policy_file;
-            if (pf.error_line > 0) error += ":" + std::to_string(pf.error_line);
-            error += ": " + pf.error;
+        auto loaded = load_policy(a.policy_file);
+        if (!loaded) {
+            // The line number is already folded into the message by
+            // ParseError::describe(), so there is no second field to forget.
+            error = a.policy_file + ": " + loaded.error();
             return std::nullopt;
         }
+        // Only reachable on success, so `pf` is a policy that really parsed --
+        // the type system, not a convention, guarantees it.
+        const PolicyFile& pf = loaded.value();
+
         for (const auto& w : pf.warnings) {
             std::fprintf(stderr, "bastion: [warning] %s\n", w.c_str());
         }

@@ -1,5 +1,7 @@
 #include "bastion/backend/namespaces.hpp"
 
+#include "bastion/unique_fd.hpp"
+
 #if defined(__linux__)
 
 #  include <fcntl.h>
@@ -73,7 +75,17 @@ NsCaps probe() {
     return c;
 }
 
-std::string enter_namespaces() {
+bool enter_namespaces(ForkChild tok, const char** err) noexcept {
+    (void)tok;  // compile-time proof of context; no runtime state
+    const auto setf = [err](const char* m) { if (err) *err = m; };
+    setf(nullptr);
+
+    // ALLOCATION-FREE FROM HERE DOWN. This runs between fork() and exec(), and
+    // at T3 the egress broker's accept thread was live at fork time -- so a
+    // std::string here could deadlock forever on a malloc lock owned by a
+    // thread that does not exist in this process. Every error is a static
+    // string; UniqueFd only ever calls close(2), which is async-signal-safe.
+
     // The uid/gid map of a new user namespace CANNOT be written by the process
     // that created it: an unprivileged self-write returns EPERM, because
     // writing a map requires CAP_SETUID in the PARENT namespace and the
@@ -86,33 +98,40 @@ std::string enter_namespaces() {
     // function is structured as fork-then-map rather than a straight line.
     //
     // So: fork FIRST, let the child unshare, and have the parent write its map.
-    int ready[2];   // child -> parent: "I have unshared"
-    int mapped[2];  // parent -> child: "your map is written"
-    if (::pipe(ready) != 0) {
-        return std::string{"pipe failed: "} + std::strerror(errno);
+    int rp[2] = {-1, -1};   // child -> parent: "I have unshared"
+    int mp[2] = {-1, -1};   // parent -> child: "your map is written"
+    if (::pipe(rp) != 0) {
+        setf("pipe(ready) failed");
+        return false;
     }
-    if (::pipe(mapped) != 0) {
-        ::close(ready[0]);
-        ::close(ready[1]);
-        return std::string{"pipe failed: "} + std::strerror(errno);
+    UniqueFd ready_r{rp[0]}, ready_w{rp[1]};
+    if (::pipe(mp) != 0) {
+        setf("pipe(mapped) failed");
+        return false;  // ready_* closed by ~UniqueFd
     }
+    UniqueFd mapped_r{mp[0]}, mapped_w{mp[1]};
 
     const uid_t uid = ::getuid();
     const gid_t gid = ::getgid();
 
     const pid_t child = ::fork();
     if (child < 0) {
-        return std::string{"fork failed: "} + std::strerror(errno);
+        setf("fork for user namespace failed");
+        return false;  // all four ends closed by ~UniqueFd
     }
 
     if (child > 0) {
         // ---- parent: write the child's maps, then mirror its exit ----------
-        ::close(ready[1]);
-        ::close(mapped[0]);
+        ready_w.reset();
+        mapped_r.reset();
 
         char c = 0;
-        const bool unshared = ::read(ready[0], &c, 1) == 1 && c == 'u';
-        ::close(ready[0]);
+        ssize_t n;
+        do {
+            n = ::read(ready_r.get(), &c, 1);
+        } while (n < 0 && errno == EINTR);
+        const bool unshared = n == 1 && c == 'u';
+        ready_r.reset();
 
         if (unshared) {
             char path[64];
@@ -135,8 +154,8 @@ std::string enter_namespaces() {
         }
 
         c = 'm';
-        (void)::write(mapped[1], &c, 1);
-        ::close(mapped[1]);
+        (void)::write(mapped_w.get(), &c, 1);
+        mapped_w.reset();
 
         // Mirror the workload's exit status so this extra process level is
         // invisible to everything upstream.
@@ -151,28 +170,32 @@ std::string enter_namespaces() {
     }
 
     // ---- child: unshare, wait to be mapped, then become pid 1 --------------
-    ::close(ready[0]);
-    ::close(mapped[1]);
+    ready_r.reset();
+    mapped_w.reset();
 
     if (::unshare(CLONE_NEWUSER) != 0) {
-        return std::string{"unshare(CLONE_NEWUSER) failed: "} + std::strerror(errno);
+        setf("unshare(CLONE_NEWUSER) failed");
+        return false;
     }
 
     char c = 'u';
-    (void)::write(ready[1], &c, 1);
-    ::close(ready[1]);
+    (void)::write(ready_w.get(), &c, 1);
+    ready_w.reset();
 
     // Block until the parent has written our uid/gid map. Acting before that
     // would run as `nobody` (65534) and every subsequent step would fail in a
     // way that looks like a permissions bug rather than a race.
-    (void)::read(mapped[0], &c, 1);
-    ::close(mapped[0]);
+    ssize_t n;
+    do {
+        n = ::read(mapped_r.get(), &c, 1);
+    } while (n < 0 && errno == EINTR);
+    mapped_r.reset();
 
     // PID + IPC. IPC keeps SysV queues and POSIX shared memory from being a
     // side channel to processes outside the sandbox.
     if (::unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC) != 0) {
-        return std::string{"unshare(CLONE_NEWPID|NEWNS|NEWIPC) failed: "} +
-               std::strerror(errno);
+        setf("unshare(CLONE_NEWPID|NEWNS|NEWIPC) failed");
+        return false;
     }
 
     // unshare(CLONE_NEWPID) does NOT move the caller into the new namespace --
@@ -181,7 +204,8 @@ std::string enter_namespaces() {
     // behind to reap it and mirror its exit status.
     const pid_t inner = ::fork();
     if (inner < 0) {
-        return std::string{"fork into PID namespace failed: "} + std::strerror(errno);
+        setf("fork into PID namespace failed");
+        return false;
     }
     if (inner > 0) {
         int st = 0;
@@ -203,10 +227,11 @@ std::string enter_namespaces() {
     // A fresh /proc is what makes the PID namespace OBSERVABLE. Without it the
     // inherited /proc still shows every host process -- the isolation would be
     // real but invisible, and `ps aux` would keep leaking. Best-effort: if it
-    // fails the PID namespace still contains the workload.
+    // fails the PID namespace still contains the workload, so this is a loss of
+    // observability rather than of confinement.
     ::mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr);
 
-    return {};
+    return true;
 }
 
 }  // namespace bastion::linux_ns
@@ -219,7 +244,10 @@ NsCaps probe() {
     c.reason = "not Linux";
     return c;
 }
-std::string enter_namespaces() { return "not Linux"; }
+bool enter_namespaces(ForkChild, const char** err) noexcept {
+    if (err) *err = "namespaces are Linux-only";
+    return false;
+}
 }  // namespace bastion::linux_ns
 
 #endif

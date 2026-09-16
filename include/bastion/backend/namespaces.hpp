@@ -29,6 +29,8 @@
 // reported, never silently assumed.
 #pragma once
 
+#include "bastion/forksafe.hpp"
+
 #include <string>
 
 namespace bastion::linux_ns {
@@ -47,12 +49,21 @@ struct NsCaps {
 // Enter new user/PID/IPC namespaces in the CURRENT process.
 //
 // Must be called in the child, BEFORE the sandbox is applied and before exec.
-// Returns empty on success, else an error message.
+// Returns true on success; on failure `err` receives a STATIC string naming the
+// step that failed.
+//
+// ALLOCATION-FREE, and the ForkChild token makes that checkable rather than
+// merely documented (see forksafe.hpp). This runs between fork() and exec() in
+// a process that may be multithreaded -- at T3 the egress broker's accept
+// thread is live -- where building a std::string can deadlock forever on a
+// malloc lock held by a thread that does not exist in the child. An earlier
+// version returned std::string here; that was the same latent bug already found
+// and fixed in the Landlock path.
 //
 // IMPORTANT: unshare(CLONE_NEWPID) does not move the caller into the new PID
 // namespace -- only its children get pid 1. The caller must fork() afterwards;
 // enter_namespaces() therefore does that fork itself and returns only in the
 // grandchild, so callers can treat it as "after this, I am isolated".
-[[nodiscard]] std::string enter_namespaces();
+[[nodiscard]] bool enter_namespaces(ForkChild tok, const char** err) noexcept;
 
 }  // namespace bastion::linux_ns

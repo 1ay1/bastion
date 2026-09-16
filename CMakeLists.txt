@@ -159,4 +159,22 @@ if(BASTION_BUILD_TESTS)
                          -DFILE=tests/forksafe_test.cpp
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
     endforeach()
+
+    # Invariant types: Result<T> (no unchecked failures) and UniqueFd (no
+    # leaked descriptors). A leaked fd is not just a resource here -- rights
+    # attach to the open file description, so it is authority.
+    add_executable(invariants_test tests/invariants_test.cpp)
+    target_link_libraries(invariants_test PRIVATE bastion)
+    add_test(NAME invariants COMMAND invariants_test)
+
+    foreach(case 1 2 3 4 5)
+        add_test(NAME invariants_negative_${case}
+                 COMMAND ${CMAKE_COMMAND}
+                         -DTEST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+                         -DCASE=${case}
+                         -DFILE=tests/invariants_test.cpp
+                         -DEXTRA_FLAGS=-Werror
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/negative_compile.cmake)
+    endforeach()
 endif()

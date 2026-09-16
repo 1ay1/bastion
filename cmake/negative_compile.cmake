@@ -6,8 +6,15 @@ if(NOT DEFINED FILE)
     set(FILE tests/cap_test.cpp)
 endif()
 
+# EXTRA_FLAGS lets a case rely on a warning being fatal -- [[nodiscard]] is a
+# warning by default, and "you ignored a failure" is exactly the bug class we
+# are asserting is impossible.
+if(NOT DEFINED EXTRA_FLAGS)
+    set(EXTRA_FLAGS "")
+endif()
+
 execute_process(
-    COMMAND ${TEST_CXX} -std=c++23 -I${SRC}/include -DCASE=${CASE}
+    COMMAND ${TEST_CXX} -std=c++23 -I${SRC}/include -DCASE=${CASE} ${EXTRA_FLAGS}
             -fsyntax-only ${SRC}/${FILE}
     RESULT_VARIABLE rc
     OUTPUT_QUIET ERROR_VARIABLE err)

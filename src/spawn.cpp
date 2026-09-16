@@ -1,5 +1,7 @@
 #include "bastion/spawn.hpp"
 
+#include "bastion/unique_fd.hpp"
+
 #include <spawn.h>
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -59,7 +61,23 @@ enum class ChildStage : unsigned char {
     Chdir = 1,
     Sandbox = 2,
     Exec = 3,
+
+    // DEGRADED, not failed. Everything above means "bastion could not set the
+    // child up, so it was NOT executed". This one means the workload DID run
+    // with the full kernel boundary, but one defence-in-depth layer could not
+    // be installed. Reported as a warning; the exit code stays the workload's
+    // own, because the run really did happen.
+    //
+    // It exists because the alternative was worse: the namespace failure used
+    // to be discarded entirely, so a run that silently lost process isolation
+    // was indistinguishable from one that had it.
+    Namespace = 100,
 };
+
+// Is this stage a setup FAILURE (workload never ran) or a DEGRADATION?
+constexpr bool is_fatal_stage(ChildStage s) noexcept {
+    return s != ChildStage::Namespace;
+}
 
 // Pick a working directory the child actually has authority to read.
 //
@@ -450,47 +468,55 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // O_CLOEXEC means a successful execve closes it without a write, so the
     // parent reads EOF and knows the workload really started -- no inference
     // from an exit code the workload itself can produce.
-    int status_pipe[2] = {-1, -1};
+    //
+    // Owned by UniqueFd so no return path can leak them. An earlier version
+    // hand-closed these and MISSED the macOS case where pipe() succeeds but
+    // fcntl() fails -- two descriptors leaked per attempt. A leaked fd here is
+    // not merely a resource: rights attach to the open file description, so a
+    // stray descriptor is authority that outlives its scope.
+    int raw_pipe[2] = {-1, -1};
 #if defined(__linux__)
     // pipe2 sets CLOEXEC atomically: with pipe()+fcntl() a concurrent fork in
     // another thread could inherit the not-yet-CLOEXEC write end and hold it
     // open, and the parent would then block forever waiting for an EOF.
-    const bool pipe_ok = ::pipe2(status_pipe, O_CLOEXEC) == 0;
+    const bool created = ::pipe2(raw_pipe, O_CLOEXEC) == 0;
+    UniqueFd pipe_r{raw_pipe[0]}, pipe_w{raw_pipe[1]};
+    const bool pipe_ok = created;
 #else
     // macOS has no pipe2(2), so there is an unavoidable window between pipe()
     // and fcntl() in which a concurrent fork could inherit the write end.
     // bastion DOES fork from a multithreaded process at T3 (the egress broker
     // runs an accept thread), but only bastion itself forks, and it does so
     // from this one function -- so nothing else is racing these descriptors.
+    const bool created = ::pipe(raw_pipe) == 0;
+    // Adopt IMMEDIATELY, before the fcntl calls that may fail: from here on
+    // both ends are closed by the destructor no matter which path is taken.
+    UniqueFd pipe_r{raw_pipe[0]}, pipe_w{raw_pipe[1]};
     const bool pipe_ok =
-        ::pipe(status_pipe) == 0 &&
-        ::fcntl(status_pipe[0], F_SETFD, FD_CLOEXEC) == 0 &&
-        ::fcntl(status_pipe[1], F_SETFD, FD_CLOEXEC) == 0;
+        created &&
+        ::fcntl(pipe_r.get(), F_SETFD, FD_CLOEXEC) == 0 &&
+        ::fcntl(pipe_w.get(), F_SETFD, FD_CLOEXEC) == 0;
 #endif
     if (!pipe_ok) {
-        // Close whatever pipe() did manage to create. On the macOS path a
-        // failing fcntl() leaves BOTH ends open, so returning without this
-        // leaks two descriptors per attempt.
-        if (status_pipe[0] >= 0) ::close(status_pipe[0]);
-        if (status_pipe[1] >= 0) ::close(status_pipe[1]);
         out.error = std::string{"status pipe failed: "} + std::strerror(errno);
-        return out;
+        return out;  // both ends closed by ~UniqueFd
     }
 
     pid_t pid = ::fork();
     if (pid < 0) {
         out.error = std::string{"fork failed: "} + std::strerror(errno);
-        ::close(status_pipe[0]);
-        ::close(status_pipe[1]);
-        return out;
+        return out;  // both ends closed by ~UniqueFd
     }
 
     if (pid == 0) {
         // ---- child ---------------------------------------------------------
         // Ordering is load-bearing (see spawn.hpp). Only async-signal-safe
         // calls past this point; no allocation, no iostreams.
-        ::close(status_pipe[0]);
-        const int sfd = status_pipe[1];
+        //
+        // Raw ints from here: UniqueFd's destructor would close the write end
+        // on the _exit path, and the child must control that lifetime itself.
+        pipe_r.reset();
+        const int sfd = pipe_w.release();
 
         // Report which step failed, then exit. write(2) is async-signal-safe;
         // the result is deliberately ignored (nothing useful to do if the
@@ -500,6 +526,15 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
             ssize_t n;
             do { n = ::write(sfd, &b, 1); } while (n < 0 && errno == EINTR);
             _exit(code);
+        };
+
+        // Report a DEGRADATION and keep going: the workload still runs behind
+        // the kernel boundary, it has just lost one defence-in-depth layer.
+        // The parent turns this into a warning rather than an error.
+        const auto fail_soft = [sfd](ChildStage st) {
+            const unsigned char b = static_cast<unsigned char>(st);
+            ssize_t n;
+            do { n = ::write(sfd, &b, 1); } while (n < 0 && errno == EINTR);
         };
 
         if (cwd && ::chdir(cwd) != 0) fail(ChildStage::Chdir, kExitChdirFailed);
@@ -600,7 +635,15 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // isolation, which compile() reports as a warning. Refusing to run
         // would be worse -- it trades a real filesystem boundary for nothing.
         if (ns_isolate) {
-            (void)linux_ns::enter_namespaces();
+            const char* nserr = nullptr;
+            if (!linux_ns::enter_namespaces(bastion::ForkBoundary::in_child(),
+                                            &nserr)) {
+                // Report, do NOT abort. Losing process isolation is a lost
+                // mitigation; losing the Landlock boundary would be a hole. An
+                // earlier version discarded this result entirely, so a failure
+                // here was invisible -- the run looked isolated when it was not.
+                fail_soft(ChildStage::Namespace);
+            }
         }
 
         // Confinement lands here: after fork (so bastion stays unconfined),
@@ -632,7 +675,7 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     // ---- parent ------------------------------------------------------------
     // The write end must not stay open here, or the read below would never see
     // EOF on the success path.
-    ::close(status_pipe[1]);
+    pipe_w.reset();
 
     out.pid = static_cast<int>(pid);
     out.pgid = static_cast<int>(pid);  // setpgid(0,0) in the child => pgid == pid
@@ -647,11 +690,14 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         unsigned char b = 0;
         ssize_t n;
         do {
-            n = ::read(status_pipe[0], &b, 1);
+            n = ::read(pipe_r.get(), &b, 1);
         } while (n < 0 && errno == EINTR);
+        // n == 1: the child reported a stage. n == 0: EOF, it exec'd. n < 0 is
+        // a pipe error we cannot attribute, so we do NOT invent a stage --
+        // spawn_wait() still reports the child's real exit status.
         out.setup_stage = (n == 1) ? b : 0;
     }
-    ::close(status_pipe[0]);
+    pipe_r.reset();
 
     if (!req.wait) return out;  // caller will spawn_wait() later
 
@@ -737,6 +783,15 @@ void spawn_wait(SpawnResult& out) {
             break;
         case ChildStage::Exec:
             out.error = "exec failed (binary missing or not executable)";
+            break;
+        case ChildStage::Namespace:
+            // NOT an error: the workload ran with the full kernel boundary and
+            // only lost process-table isolation. Setting out.error here would
+            // make launched() false for a run that really happened.
+            out.warnings.push_back(
+                "T3 process isolation could not be installed; the workload ran "
+                "with the full filesystem and network boundary but the host "
+                "process table was visible to it");
             break;
         default:
             break;

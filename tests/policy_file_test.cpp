@@ -43,9 +43,10 @@ int main() {
         add("net.egress", "registry.npmjs.org:443");
 
         const std::string toml = synthesize(led).to_toml();
-        auto pf = parse_policy(toml);
-        check(pf.ok, "synthesize output parses");
-        if (!pf.ok) std::printf("      error: %s\n", pf.error.c_str());
+        auto parsed = parse_policy(toml);
+        check(parsed.ok(), "synthesize output parses");
+        if (!parsed) std::printf("      error: %s\n", parsed.error().c_str());
+        const auto& pf = parsed.value();
         check(pf.rules.size() == 3, "all three grants survived the round trip");
 
         bool r = false, w = false, n = false;
@@ -66,7 +67,7 @@ int main() {
         // policy would produce a sandbox the user believes is tight.
         auto bad = [&](const char* label, const char* text) {
             auto pf = parse_policy(text);
-            check(!pf.ok, label);
+            check(!pf.ok(), label);
         };
         bad("unknown op rejected",
             "[[allow]]\nop = \"fs.telepathy\"\npath = \"/x\"\n");
@@ -79,20 +80,21 @@ int main() {
 
         // ...but a valid file with only comments is fine (no grants).
         auto empty = parse_policy("# nothing here\n");
-        check(empty.ok && empty.rules.empty(), "comment-only file is valid");
+        check(empty.ok() && empty.value().rules.empty(),
+              "comment-only file is valid");
     }
 
     std::puts("\n== tier and escapes ==");
     {
         auto pf = parse_policy("tier = \"T3\"\n[[allow]]\nop = \"net.egress\"\n"
                                "path = \"api.example.com:443\"\n");
-        check(pf.ok && pf.tier == Tier::Isolate, "tier parsed");
+        check(pf.ok() && pf.value().tier == Tier::Isolate, "tier parsed");
 
         auto esc = parse_policy(
             "[[allow]]\nop = \"fs.read\"\npath = \"/tmp/we\\\"ird\"\n");
-        check(esc.ok, "escaped quote in path parses");
-        check(esc.ok && esc.rules.size() == 1 &&
-                  has(esc.rules[0].scope, "we\"ird"),
+        check(esc.ok(), "escaped quote in path parses");
+        check(esc.ok() && esc.value().rules.size() == 1 &&
+                  has(esc.value().rules[0].scope, "we\"ird"),
               "escape decoded to a literal quote");
     }
 
@@ -120,9 +122,11 @@ int main() {
         fs::create_directories("/tmp/bastion-pf");
         { std::ofstream f(path); f << text; }
 
-        auto pf = load_policy(path);
-        check(pf.ok, "policy file loaded from disk");
-        auto sealed = to_sealed(pf);
+        auto loaded = load_policy(path);
+        check(loaded.ok(), "policy file loaded from disk");
+        // to_sealed() now takes a PolicyFile, which only exists on success --
+        // sealing an unparsed file is no longer expressible.
+        auto sealed = to_sealed(loaded.value());
 
         SpawnRequest ok;
         ok.argv = {"/bin/sh", "-c", "echo hi > /tmp/bastion-pf-ws/f.txt"};

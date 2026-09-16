@@ -71,20 +71,26 @@ struct Pending {
 
 }  // namespace
 
-PolicyFile parse_policy(std::string_view text) {
+Result<PolicyFile> parse_policy(std::string_view text) {
     PolicyFile pf;
     Pending cur;
 
-    auto flush = [&]() -> bool {
+    // A parse failure now RETURNS instead of stashing a flag, so there is no
+    // way to reach the partially-built pf afterwards.
+    const auto at = [](std::string msg, int line) {
+        return Error{ParseError{std::move(msg), line}.describe()};
+    };
+
+    auto flush = [&](std::string& err, int& errline) -> bool {
         if (!cur.active) return true;
         if (cur.op.empty()) {
-            pf.error = "[[allow]] block is missing `op`";
-            pf.error_line = cur.line;
+            err = "[[allow]] block is missing `op`";
+            errline = cur.line;
             return false;
         }
         if (cur.path.empty()) {
-            pf.error = "[[allow]] block for op '" + cur.op + "' is missing `path`";
-            pf.error_line = cur.line;
+            err = "[[allow]] block for op '" + cur.op + "' is missing `path`";
+            errline = cur.line;
             return false;
         }
         const Right r = right_for_op_name(cur.op);
@@ -92,10 +98,10 @@ PolicyFile parse_policy(std::string_view text) {
             // Fail closed: an op we do not understand might be one we should
             // have restricted. Silently dropping it would quietly widen or
             // narrow the policy without telling anyone.
-            pf.error = "unknown op '" + cur.op +
-                       "' (expected fs.read, fs.write, fs.exec, net.egress, "
-                       "net.bind)";
-            pf.error_line = cur.line;
+            err = "unknown op '" + cur.op +
+                  "' (expected fs.read, fs.write, fs.exec, net.egress, "
+                  "net.bind)";
+            errline = cur.line;
             return false;
         }
         pf.rules.push_back(Rule{r, cur.path,
@@ -107,6 +113,8 @@ PolicyFile parse_policy(std::string_view text) {
     std::istringstream in{std::string{text}};
     std::string raw;
     int lineno = 0;
+    std::string ferr;
+    int fline = 0;
 
     while (std::getline(in, raw)) {
         ++lineno;
@@ -114,7 +122,7 @@ PolicyFile parse_policy(std::string_view text) {
         if (line.empty() || line.front() == '#') continue;
 
         if (line == "[[allow]]") {
-            if (!flush()) return pf;
+            if (!flush(ferr, fline)) return at(ferr, fline);
             cur.active = true;
             cur.line = lineno;
             continue;
@@ -122,7 +130,7 @@ PolicyFile parse_policy(std::string_view text) {
         if (line.front() == '[') {
             // Any other table ends the current block; unknown tables are
             // reported rather than ignored.
-            if (!flush()) return pf;
+            if (!flush(ferr, fline)) return at(ferr, fline);
             pf.warnings.emplace_back("ignoring unknown table " +
                                      std::string{line} + " at line " +
                                      std::to_string(lineno));
@@ -131,19 +139,16 @@ PolicyFile parse_policy(std::string_view text) {
 
         const auto eq = line.find('=');
         if (eq == std::string_view::npos) {
-            pf.error = "expected `key = value`";
-            pf.error_line = lineno;
-            return pf;
+            return at("expected `key = value`", lineno);
         }
         const std::string_view key = trim(line.substr(0, eq));
         const std::string_view val = trim(line.substr(eq + 1));
 
         std::string sval;
         if (!unquote(val, sval)) {
-            pf.error = "value for `" + std::string{key} +
-                       "` must be a quoted string";
-            pf.error_line = lineno;
-            return pf;
+            return at("value for `" + std::string{key} +
+                          "` must be a quoted string",
+                      lineno);
         }
 
         if (!cur.active) {
@@ -151,9 +156,7 @@ PolicyFile parse_policy(std::string_view text) {
                 bool ok = false;
                 pf.tier = parse_tier_name(sval, ok);
                 if (!ok) {
-                    pf.error = "unknown tier '" + sval + "'";
-                    pf.error_line = lineno;
-                    return pf;
+                    return at("unknown tier '" + sval + "'", lineno);
                 }
             } else {
                 pf.warnings.emplace_back("ignoring unknown key `" +
@@ -173,17 +176,14 @@ PolicyFile parse_policy(std::string_view text) {
         }
     }
 
-    if (!flush()) return pf;
-    pf.ok = true;
+    if (!flush(ferr, fline)) return at(ferr, fline);
     return pf;
 }
 
-PolicyFile load_policy(const std::string& path) {
+Result<PolicyFile> load_policy(const std::string& path) {
     std::ifstream f(path);
     if (!f) {
-        PolicyFile pf;
-        pf.error = "cannot open policy file: " + path;
-        return pf;
+        return Error{"cannot open policy file: " + path};
     }
     std::ostringstream ss;
     ss << f.rdbuf();
