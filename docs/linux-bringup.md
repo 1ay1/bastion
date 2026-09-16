@@ -4,7 +4,7 @@ Everything you need to get bastion enforcing on Linux.
 
 **STATUS: the Landlock backend now runs, enforces, and passes its full suite on
 a real kernel.** First bring-up measured on **kernel 7.2.2-zen1 (Landlock ABI
-v10), GCC 16.2.1**: 31/31 tests green, adversarial suite 38 attempts / 0
+v10), GCC 16.2.1**: 32/32 tests green, adversarial suite 38 attempts / 0
 escapes / 1 documented limit, T3 per-host egress verified end to end against a
 live host.
 

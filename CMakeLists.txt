@@ -120,6 +120,11 @@ if(BASTION_BUILD_TESTS)
     # CLOSED LOOP: observe -> synthesize -> re-run under the derived policy.
     # Proves `bastion synthesize` emits a policy that actually WORKS, rather
     # than one that merely looks plausible.
+    add_executable(capture_test tests/capture_test.cpp)
+    target_link_libraries(capture_test PRIVATE bastion)
+    add_test(NAME capture COMMAND capture_test)
+    set_tests_properties(capture PROPERTIES TIMEOUT 60)
+
     add_executable(closed_loop_test tests/closed_loop_test.cpp)
     target_link_libraries(closed_loop_test PRIVATE bastion)
     add_test(NAME closed_loop COMMAND closed_loop_test)

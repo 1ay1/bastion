@@ -14,7 +14,7 @@ bastion run --policy bastion.toml -- ./legacy-build.sh
 
 | | |
 |---|---|
-| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 31/31 tests, 38 adversarial escape attempts, **0 escapes**. One residual limit is named and asserted rather than hidden — path *existence* is probeable, though contents are not. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
+| **Linux** | **Supported.** T0–T3 measured on kernel 7.2.2 (Landlock ABI v10): 32/32 tests, 38 adversarial escape attempts, **0 escapes**. One residual limit is named and asserted rather than hidden — path *existence* is probeable, though contents are not. Observation is unprivileged (seccomp user-notification) and PID/IPC isolation is real. See [`docs/linux-bringup.md`](docs/linux-bringup.md). |
 | **macOS** | Best-effort. A Seatbelt backend exists and the shared code is syntax-checked for `__APPLE__` in CI, but it has **not been run or measured** since the Linux hardening work. Treat it as unverified. |
 | **Windows** | Specified only (AppContainer + restricted token). Not implemented. |
 

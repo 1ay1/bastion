@@ -102,6 +102,31 @@ struct SpawnRequest {
     // (see signal_forward.hpp for why that is a confinement problem, not just
     // untidiness).
     bool wait = true;
+
+    // Capture the child's stdout+stderr instead of letting it inherit ours.
+    //
+    // The CLI does not need this — a terminal user WANTS the workload's
+    // output on their terminal, interleaved live. A HOST embedding bastion
+    // does: agentty runs tools whose output is the tool result, and it has
+    // to read those bytes rather than leak them to whatever terminal agentty
+    // itself was launched from.
+    //
+    // Without it, embedding bastion as a library means re-implementing the
+    // pipe plumbing outside the sandbox — and doing it in the parent, where
+    // the descriptors are not covered by spawn()'s own fd discipline. Better
+    // here, once, where the fork already owns every descriptor decision.
+    //
+    // Combined (2>&1) rather than two streams: a tool result is one
+    // chronological transcript, and separating them loses the interleaving
+    // that makes a failure legible — which error line followed which
+    // progress line.
+    bool capture_output = false;
+
+    // Cap on captured bytes. 0 = unlimited (dangerous for a `yes` loop).
+    // Beyond the cap the read stops and SpawnResult::output_truncated is set,
+    // so a caller can say "truncated" rather than silently presenting a
+    // prefix as the whole answer.
+    std::size_t max_output_bytes = 0;
 };
 
 struct EgressAttempt;  // proxy.hpp
@@ -115,6 +140,14 @@ struct SpawnResult {
     std::string profile;                   // exact policy applied, for auditing
     int pid = -1;                          // child pid
     int pgid = -1;                         // child process GROUP (== pid)
+
+    // The child's combined stdout+stderr, when SpawnRequest::capture_output
+    // asked for it. Empty otherwise — the child wrote straight to the
+    // inherited descriptors and nothing was intercepted.
+    std::string output;
+    // True when max_output_bytes stopped the read before EOF. A caller must
+    // say so rather than presenting a prefix as the whole answer.
+    bool output_truncated = false;
 
     // Which of BASTION'S OWN setup steps failed in the child, reported over a
     // CLOEXEC status pipe: 0 = none (the workload really exec'd), 1 = chdir,

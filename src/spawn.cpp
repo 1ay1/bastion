@@ -740,6 +740,27 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         return out;  // both ends closed by ~UniqueFd
     }
 
+    // Output-capture pipe, when the caller asked for it (see spawn.hpp).
+    // Deliberately NOT O_CLOEXEC on the write end: the child dup2()s it onto
+    // stdout/stderr and those must survive execve — that is the whole point.
+    // The read end IS close-on-exec, so the workload cannot read back what it
+    // or a sibling wrote.
+    int cap_pipe[2] = {-1, -1};
+    UniqueFd cap_r, cap_w;
+    if (req.capture_output) {
+        if (::pipe(cap_pipe) != 0) {
+            out.error = std::string{"capture pipe failed: "} + std::strerror(errno);
+            return out;
+        }
+        cap_r = UniqueFd{cap_pipe[0]};
+        cap_w = UniqueFd{cap_pipe[1]};
+        if (::fcntl(cap_r.get(), F_SETFD, FD_CLOEXEC) != 0) {
+            out.error = std::string{"capture pipe cloexec failed: "}
+                      + std::strerror(errno);
+            return out;
+        }
+    }
+
     pid_t pid = ::fork();
     if (pid < 0) {
         out.error = std::string{"fork failed: "} + std::strerror(errno);
@@ -755,6 +776,22 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
         // on the _exit path, and the child must control that lifetime itself.
         pipe_r.reset();
         const int sfd = pipe_w.release();
+
+        // Redirect stdout+stderr onto the capture pipe, when asked. Before
+        // any sandbox is applied and before exec, so the workload starts
+        // with them already pointing at the pipe and cannot tell the
+        // difference. dup2 is async-signal-safe.
+        //
+        // The read end goes first: the child must not hold it open, or the
+        // parent's read never sees EOF when the child exits and spawn()
+        // hangs forever.
+        if (cap_w.get() >= 0) {
+            ::close(cap_r.release());
+            const int cfd = cap_w.release();
+            (void)::dup2(cfd, STDOUT_FILENO);
+            (void)::dup2(cfd, STDERR_FILENO);
+            if (cfd > STDERR_FILENO) ::close(cfd);
+        }
 
         // Report which step failed, then exit. write(2) is async-signal-safe;
         // the result is deliberately ignored (nothing useful to do if the
@@ -959,6 +996,43 @@ SpawnResult spawn(const Sealed& policy, const SpawnRequest& req) {
     pipe_r.reset();
 
     if (!req.wait) return out;  // caller will spawn_wait() later
+
+    // Drain the capture pipe BEFORE waiting, not after.
+    //
+    // A pipe holds ~64 KiB. A child that writes more than that blocks in
+    // write() until someone reads, and if the parent is sitting in waitpid()
+    // neither side can move — a deadlock that only appears for workloads
+    // whose output happens to exceed the buffer, which is every real build
+    // log and no test fixture. Read to EOF first: EOF arrives when the last
+    // copy of the write end closes, which execve/_exit guarantees.
+    if (cap_r.get() >= 0) {
+        cap_w.reset();   // parent's copy must go, or EOF never comes
+        char buf[16 * 1024];
+        for (;;) {
+            const ssize_t n = ::read(cap_r.get(), buf, sizeof buf);
+            if (n > 0) {
+                const std::size_t take = static_cast<std::size_t>(n);
+                if (req.max_output_bytes > 0
+                    && out.output.size() + take > req.max_output_bytes) {
+                    const std::size_t room =
+                        req.max_output_bytes > out.output.size()
+                            ? req.max_output_bytes - out.output.size() : 0;
+                    out.output.append(buf, room);
+                    out.output_truncated = true;
+                    // Keep draining and discarding: stopping here would
+                    // block the child on a full pipe and hang the wait
+                    // below, turning a cap into a deadlock.
+                    continue;
+                }
+                out.output.append(buf, take);
+                continue;
+            }
+            if (n == 0) break;                 // EOF: the child is done writing
+            if (errno == EINTR) continue;
+            break;                             // real error; keep what we have
+        }
+        cap_r.reset();
+    }
 
     spawn_wait(out);
 
