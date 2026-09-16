@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <set>
 
 using namespace bastion;
 namespace fs = std::filesystem;
@@ -211,6 +212,63 @@ int main() {
               "a nested tree collapses to its top-most granted directory");
         check(rules <= 2,
               "the whole observation reduces to a reviewable policy");
+
+        // No grant is ever written twice. Rules arrive from separate
+        // right-set buckets and write-coalescing adds a paired fs.read, so a
+        // directory that was ALSO read on its own produced two identical
+        // blocks -- MEASURED on a python workload. Harmless to the kernel, but
+        // a reviewer who sees a duplicated rule stops trusting the list.
+        {
+            std::set<std::string> seen_paths;
+            bool dup = false;
+            std::size_t pos = 0;
+            while ((pos = t3.find("path  = \"", pos)) != std::string::npos) {
+                pos += 9;
+                const auto end = t3.find('"', pos);
+                if (end == std::string::npos) break;
+                const std::string path = t3.substr(pos, end - pos);
+                // Same path may legitimately appear under two DIFFERENT ops
+                // (fs.read + fs.write); only an exact repeat is a bug, and the
+                // reviewability case above emits a single op, so a repeat here
+                // is always a duplicate.
+                if (!seen_paths.insert(path).second) dup = true;
+            }
+            check(!dup, "no grant is emitted twice");
+        }
+    }
+
+    std::puts("\n== optional probes are not turned into grants ==");
+    {
+        // The one class observation cannot judge alone: `observe` runs the
+        // workload UNCONFINED, so every access records as `allow` and a read
+        // the program NEEDED looks identical to one it merely TRIED.
+        //
+        // MEASURED: python3 reads /proc/sys/vm/overcommit_memory to size an
+        // allocator hint, and the identical script runs fine with that grant
+        // absent. Synthesizing it is over-permission derived from a shrug.
+        Ledger led4{"/tmp/bastion-ledger-test/l4.jsonl"};
+        const std::string ws = "/tmp/bastion-ledger-test/probe";
+        fs::create_directories(ws);
+        std::ofstream{ws + "/real.txt"} << "x\n";
+
+        auto rec4 = [&](const char* op, const std::string& t) {
+            AuditRecord r;
+            r.verdict = Verdict::Allow;
+            r.op = op;
+            r.target = t;
+            led4.record(r);
+        };
+        rec4("fs.read", ws + "/real.txt");
+        rec4("fs.read", "/proc/sys/vm/overcommit_memory");
+        rec4("fs.read", "/sys/kernel/mm/transparent_hugepage/enabled");
+
+        const std::string t4 = synthesize(led4).to_toml();
+        check(!has(t4, "overcommit_memory"),
+              "a /proc/sys tunable probe is not granted");
+        check(!has(t4, "transparent_hugepage"),
+              "a /sys/kernel tunable probe is not granted");
+        check(has(t4, "real.txt"),
+              "...while a genuine read is still granted");
     }
 
     std::printf("\n%s (%d failure%s)\n",

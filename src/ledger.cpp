@@ -129,9 +129,28 @@ bool covered_by_floor(std::string_view op, std::string_view path) {
     };
     for (auto f : kFloorRead) {
         if (path == f) return true;
-        if (path.size() > f.size() && path.starts_with(f) && path[f.size()] == '/') {
+        if (path.size() > f.size() && path.starts_with(f) &&
+            path[f.size()] == '/') {
             return true;
         }
+    }
+
+    // OPTIONAL KERNEL TUNABLES. Runtimes probe these and carry on when the
+    // read fails -- CPython reads /proc/sys/vm/overcommit_memory to size an
+    // allocator hint, glibc reads /sys/kernel/mm for hugepage defaults.
+    //
+    // This is the one class observation CANNOT judge on its own: `observe`
+    // runs the workload UNCONFINED, so every access records as `allow` and a
+    // read the program NEEDED is indistinguishable from one it merely TRIED.
+    // MEASURED: python3 was granted /proc/sys/vm/overcommit_memory, and the
+    // identical script runs fine when that grant is absent.
+    //
+    // Granting them anyway is over-permission derived from a shrug, so they
+    // are dropped. If a workload genuinely needs one, it fails visibly and the
+    // user adds an explicit rule -- which is the right way round: an explicit
+    // grant is a decision, a synthesized one is a guess.
+    if (path.starts_with("/proc/sys/") || path.starts_with("/sys/kernel/")) {
+        return true;
     }
     // /dev/ttysNNN and similar.
     if (path.starts_with("/dev/ttys")) return true;
@@ -403,23 +422,35 @@ std::string Synthesis::to_toml() const {
     for (const auto& note : notes) o << "# NOTE: " << note << "\n";
     if (!notes.empty()) o << "\n";
 
-    for (const auto& r : rules) {
+    // Emitted (op, path) pairs, so the same grant is never written twice.
+    //
+    // Rules arrive from separate right-set buckets, and write-coalescing adds
+    // a paired fs.read for every directory it grants -- so a directory that
+    // was ALSO read on its own produced two identical `fs.read` blocks.
+    // MEASURED on a python workload: /tmp/sota appeared twice. Harmless to
+    // the kernel, but a reviewer who sees a duplicated rule stops trusting
+    // that the list means anything.
+    std::set<std::pair<std::string, std::string>> written;
+
+    const auto emit = [&](std::string_view op, const std::string& path,
+                          const std::string& why) {
+        if (!written.insert({std::string{op}, path}).second) return;
         o << "[[allow]]\n"
-          << "op    = \"" << op_for_right(r.right) << "\"\n"
-          << "path  = \"" << r.scope << "\"\n"
-          << "why   = \"" << r.provenance << "\"\n\n";
+          << "op    = \"" << op << "\"\n"
+          << "path  = \"" << path << "\"\n"
+          << "why   = \"" << why << "\"\n\n";
+    };
+
+    for (const auto& r : rules) {
+        emit(op_for_right(r.right), r.scope, r.provenance);
 
         // A policy file carries ONE op per block, but a right set can hold
         // several. op_for_right() reports the strongest, so a Read|Write grant
         // would silently lose its read -- and a write-only directory is one
         // Landlock cannot create files in (`ld: cannot open output file`).
-        // Emit the companion block rather than dropping the right.
         if (any(r.right & Right::FsWrite) && any(r.right & Right::FsRead)) {
-            o << "[[allow]]\n"
-              << "op    = \"fs.read\"\n"
-              << "path  = \"" << r.scope << "\"\n"
-              << "why   = \"" << r.provenance
-              << " (read is required to write here)\"\n\n";
+            emit("fs.read", r.scope,
+                 r.provenance + " (read is required to write here)");
         }
     }
     if (rules.empty()) {
