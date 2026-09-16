@@ -157,6 +157,11 @@ POLICY OPTIONS
   cannot route around it. At t2, --net is all-or-nothing (the kernel matches
   sockets, not hostnames) and bastion says so rather than implying otherwise.
 
+  t3 also reaps the whole process tree. At t2 a workload that detaches with
+  setsid() outlives bastion -- it has left the process group, which is the
+  only handle a path-set sandbox has on it. It keeps only what the policy
+  granted, but it keeps it. t3's PID namespace closes that for free.
+
   --yolo                 grant Unconfined: no restriction is enforced.
                          NOT the same as disabling bastion — the audit ledger
                          stays fully active, so `bastion synthesize` can turn

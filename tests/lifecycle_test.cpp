@@ -16,6 +16,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <filesystem>
+
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -154,6 +156,92 @@ int main() {
         check(orphaned == 0,
               (std::string{"SIGTERM on `bastion "} + c.label +
                "` leaves NO orphaned processes").c_str());
+    }
+
+    // The OTHER half, and the one an agent actually reaches: bastion is not
+    // killed at all. It exits normally, and the workload has deliberately
+    // detached a process (setsid + background) to outlive it.
+    //
+    // MEASURED, and it is a TIER BOUNDARY rather than a bug. All three
+    // outcomes below are measured, not assumed:
+    //
+    //   run t2 -- the survivor LIVES. setsid() leaves the process group, and
+    //         the group is the only handle a path-set sandbox has on the
+    //         subtree; killpg cannot reach what has left the group. It keeps
+    //         exactly the authority the policy granted -- narrow, but after
+    //         bastion is gone.
+    //
+    //   run t3 -- the survivor DIES, for free and with no reaper: the PID
+    //         namespace is torn down when its init exits and the kernel
+    //         SIGKILLs everything inside. setsid does not escape a namespace.
+    //
+    //   observe -- the survivor DIES TOO, which is the outcome that matters
+    //         most: an observed workload runs UNCONFINED, so a survivor would
+    //         hold the user's FULL authority indefinitely and keep appending
+    //         to the ledger that `synthesize` later mines. It dies because
+    //         the supervisor loop runs until the seccomp listener reports
+    //         POLLHUP -- i.e. until the last process carrying the filter is
+    //         gone -- and a detached child inherits the filter across setsid
+    //         and execve. So observation outlasts the thing being observed.
+    //
+    // All three are asserted, so none can drift silently. If you need a
+    // CONFINED workload's background processes reaped on exit, that is what
+    // --tier t3 is for.
+    //
+    // Measured with a FILE BEACON, not by grepping /proc. Process-name
+    // matching is treacherous here: the marker string also appears in the
+    // cmdline of the shell that launched the test, so a grep counts ancestors
+    // as survivors and a pkill cleanup kills the test's own shell (both
+    // happened, and both made the test silently vacuous). A beacon written
+    // after bastion has exited is unambiguous.
+    std::puts("\n== a detached process vs. a CLEAN exit (T2 limit, T3 closes) ==");
+    struct DetachCase { const char* sub; const char* tier; bool must_die; };
+    for (const auto& d : {DetachCase{"run", "t2", false},
+                          DetachCase{"run", "t3", true},
+                          DetachCase{"observe", "t0", true}}) {
+        const std::string beacon = std::string{"/tmp/bastion-detach-"} +
+                                   d.sub + "-" + d.tier + "-" +
+                                   std::to_string(::getpid());
+        ::unlink(beacon.c_str());
+
+        // Sleep PAST bastion's exit, then write. If the sandbox reaps the
+        // subtree the write never happens; if it does not, the beacon appears
+        // after bastion is already gone -- which is exactly the property.
+        // The workspace must include /tmp for the confined case to be able to
+        // write at all, so the beacon tests lifetime, not permission.
+        const std::string cmd =
+            std::string{BASTION_CLI} + " " + d.sub + " --no-ledger " +
+            (std::string{d.sub} == "run"
+                 ? std::string{"--tier "} + d.tier + " -w /tmp "
+                 : std::string{}) +
+            "-- sh -c 'setsid sh -c \"sleep 2; echo alive > " + beacon +
+            "\" </dev/null >/dev/null 2>&1 &' >/dev/null 2>&1";
+        (void)std::system(cmd.c_str());
+
+        // bastion has returned by now; wait past the detached sleep.
+        ::usleep(3500 * 1000);
+
+        std::error_code bec;
+        const bool survived = std::filesystem::exists(beacon, bec);
+        std::printf("      %-8s %s: detached process %s\n", d.sub, d.tier,
+                    survived ? "SURVIVED" : "was reaped");
+        if (d.must_die) {
+            check(!survived,
+                  std::string{d.sub} == "observe"
+                      ? "observe: a detached process cannot outlive "
+                        "observation (it would hold UNCONFINED authority)"
+                      : "T3: a detached process CANNOT outlive bastion "
+                        "(PID namespace teardown)");
+        } else {
+            // Documented, not silently tolerated: T2 grants paths, and a
+            // process that has left the process group is beyond killpg's
+            // reach. If this ever starts being reaped at T2 the docs are
+            // wrong and must be corrected upward.
+            check(survived,
+                  "T2/T0: a detached process outlives bastion -- documented "
+                  "limit, closed by --tier t3");
+        }
+        ::unlink(beacon.c_str());
     }
 
     std::printf("\n%s (%d failure%s)\n",

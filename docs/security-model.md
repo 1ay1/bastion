@@ -256,6 +256,7 @@ flips and the docs get corrected.
 | No disk-space quota | all | `--max-file-mb` caps single files, not total bytes written |
 | `--max-procs`/`--max-mem-mb` need a delegated cgroup | Linux | With one, they are a true per-sandbox budget; without, bastion falls back to RLIMIT_NPROC (per-uid, thread-counted) and reports the downgrade |
 | Path EXISTENCE is probeable | all | Landlock denies reading and listing, but `stat(2)` on a denied path still distinguishes "exists" from "does not". MEASURED: a T3 workload cannot list `/`, read `/etc/shadow` or enumerate `/home`, but `test -e /home/alice` succeeds. Closing it needs `pivot_root`; see below. |
+| A DETACHED process outlives `bastion run` | T2 | MEASURED: `setsid` leaves the process group, and the group is the only handle a path-set sandbox has on the subtree, so `killpg` cannot reach it. The survivor keeps only what the policy granted, but keeps it after bastion exits. **T3 closes it for free** — the PID namespace is destroyed when its init exits and the kernel SIGKILLs everything inside; `setsid` does not escape a namespace. Not a limit of `observe`, which waits for the seccomp listener to report `POLLHUP` — i.e. until the last filter-holder is gone — so a detached child is still observed and cannot survive with unconfined authority. |
 | Kernel exploits | all | Out of scope; T4 |
 | Landlock ABI < v2 denies cross-dir rename | T2 Linux | Kernel 5.19+ |
 | Landlock ABI < v4 cannot mediate network | T3 Linux | T3 **refused**, not degraded |
