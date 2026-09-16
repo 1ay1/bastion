@@ -192,7 +192,11 @@ ENVIRONMENT
                          launched; unset locally and nothing changes.
 
   A ./bastion.toml (or .bastion.toml) in the current directory is used
-  automatically; --policy names one elsewhere.
+  automatically, but only to NARROW: grants pointing outside that
+  directory are refused, as is egress and any tier below the one asked
+  for. The sandboxed workload can write to its own workspace, so a
+  discovered file must not be able to widen the sandbox. Use --policy to
+  apply a file in full -- that is you vouching for it from outside.
 
 EXAMPLES
   # Tight, in whatever directory you happen to be in:
@@ -389,6 +393,7 @@ std::optional<Sealed> build_policy(const Args& a, Broker& broker,
     // So the file is now found the way every other tool finds its config, and
     // --policy remains available to name one explicitly.
     std::string policy_path = a.policy_file;
+    bool discovered = false;
     if (policy_path.empty()) {
         std::error_code dec;
         const auto here = fs::current_path(dec);
@@ -397,6 +402,7 @@ std::optional<Sealed> build_policy(const Args& a, Broker& broker,
                 const auto cand = here / name;
                 if (fs::is_regular_file(cand, dec) && !dec) {
                     policy_path = cand.string();
+                    discovered = true;
                     std::fprintf(stderr, "bastion: using %s\n", name);
                     break;
                 }
@@ -419,14 +425,96 @@ std::optional<Sealed> build_policy(const Args& a, Broker& broker,
         for (const auto& w : pf.warnings) {
             std::fprintf(stderr, "bastion: [warning] %s\n", w.c_str());
         }
-        // An explicit --tier on the command line overrides the file, so a user
-        // can tighten a committed policy without editing it.
-        p = Policy{a.tier_explicit ? a.tier : pf.tier};
-        for (const auto& r : pf.rules) {
-            if (any(r.right & (Right::NetEgress | Right::NetBind))) {
-                p = std::move(p).allow_egress(r.scope, r.provenance);
-            } else {
+        // DISCOVERED POLICIES MAY NARROW, NEVER WIDEN.
+        //
+        // MEASURED escape. `bastion run` auto-loads ./bastion.toml, and the
+        // workspace it grants is WRITABLE BY THE CONFINED WORKLOAD. So the
+        // agent writes its own policy file and the next invocation hands it
+        // whatever it asked for:
+        //
+        //   bastion run -- sh -c 'printf ... path="/home/me" > bastion.toml'
+        //   bastion run -- cat ~/.ssh/id_ed25519      # -> the private key
+        //
+        // Two runs, no privilege, complete escape -- and it survives a reboot
+        // because the file persists. The bug is not in the parser or the
+        // backend; it is that authority was being taken from an input inside
+        // the blast radius. A sandbox may never widen itself on the say-so of
+        // the thing it is sandboxing.
+        //
+        // Discovery is a CONVENIENCE, so it gets convenience's authority: a
+        // discovered file may restrict what happens in its own directory, and
+        // may not reach outside it. --policy is the OPERATOR speaking, from
+        // outside the sandbox, and is honoured in full.
+        //
+        // Deliberately not solved by checking file ownership or permissions:
+        // the agent runs as the same uid as the operator, so the file it
+        // writes is indistinguishable from one the operator wrote. Only
+        // PROVENANCE separates them, and provenance is exactly the thing
+        // `--policy` carries and discovery does not.
+        std::vector<std::string> refused;
+        if (discovered) {
+            std::error_code rec;
+            const auto base = fs::path(policy_path).parent_path();
+            const auto root = fs::weakly_canonical(base, rec);
+            const std::string prefix = (rec ? base : root).string();
+
+            std::vector<Rule> kept;
+            for (const auto& r : pf.rules) {
+                // Egress is never local to a directory, so a discovered file
+                // cannot open the network at all.
+                if (any(r.right & (Right::NetEgress | Right::NetBind))) {
+                    refused.push_back("net " + r.scope);
+                    continue;
+                }
+                const auto cs = fs::weakly_canonical(fs::path(r.scope), rec);
+                const std::string s = (rec ? fs::path(r.scope) : cs).string();
+                // Inside the policy's own directory, or the directory itself.
+                const bool inside =
+                    s == prefix ||
+                    (s.size() > prefix.size() && s.starts_with(prefix) &&
+                     s[prefix.size()] == '/');
+                if (inside) {
+                    kept.push_back(r);
+                } else {
+                    refused.push_back(r.scope);
+                }
+            }
+            if (!refused.empty()) {
+                std::fprintf(stderr,
+                    "bastion: [warning] %s grants %zu path(s) outside %s; "
+                    "refused.\n"
+                    "         A discovered policy can only narrow what happens "
+                    "in its own\n"
+                    "         directory -- the sandboxed workload can write to "
+                    "that directory,\n"
+                    "         so it must not be able to widen itself. Use "
+                    "--policy %s to\n"
+                    "         apply it in full (that is you, the operator, "
+                    "vouching for it).\n",
+                    fs::path(policy_path).filename().string().c_str(),
+                    refused.size(), prefix.c_str(), policy_path.c_str());
+                for (const auto& s : refused) {
+                    std::fprintf(stderr, "         refused: %s\n", s.c_str());
+                }
+            }
+            // A discovered file may not raise the tier either: T0/T1 do not
+            // enforce, so "tier = T0" in an attacker-written file would
+            // disable the sandbox outright.
+            const Tier ft = a.tier_explicit ? a.tier : pf.tier;
+            p = Policy{ft < a.tier ? a.tier : ft};
+            for (const auto& r : kept) {
                 p = std::move(p).allow(r.right, r.scope, r.provenance);
+            }
+        } else {
+            // An explicit --tier on the command line overrides the file, so a
+            // user can tighten a committed policy without editing it.
+            p = Policy{a.tier_explicit ? a.tier : pf.tier};
+            for (const auto& r : pf.rules) {
+                if (any(r.right & (Right::NetEgress | Right::NetBind))) {
+                    p = std::move(p).allow_egress(r.scope, r.provenance);
+                } else {
+                    p = std::move(p).allow(r.right, r.scope, r.provenance);
+                }
             }
         }
         from_file = true;

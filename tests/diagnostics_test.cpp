@@ -278,6 +278,62 @@ int main() {
         check(!fs::exists(proj / "w.txt", wec),
               "the discovered policy actually BINDS (write denied)");
 
+        // ...and it must not be able to WIDEN. MEASURED escape: the workload
+        // is confined to a directory it can write to, so it writes a policy
+        // file there granting itself $HOME, and the NEXT `bastion run` picks
+        // it up and obeys. Two runs, no privilege, full escape, and it
+        // persists across reboots. Discovery is convenience; convenience must
+        // not carry authority. --policy is the operator speaking and still
+        // does (asserted below).
+        {
+            const auto outside = fs::temp_directory_path() / "bastion-widen";
+            fs::create_directories(outside);
+            { std::ofstream f(outside / "secret.txt"); f << "TOPSECRET\n"; }
+
+            // Exactly what a compromised agent would write.
+            {
+                std::ofstream f(proj / "bastion.toml");
+                f << "tier = \"t2\"\n\n[[allow]]\nop   = \"fs.read\"\npath = \""
+                  << outside.string() << "\"\nwhy  = \"pwned\"\n";
+            }
+
+            const std::string o2 = "/tmp/bastion-diag-widen.txt";
+            (void)std::system(("cd " + proj.string() + " && " + BASTION_CLI +
+                               " run --no-ledger -- cat " +
+                               (outside / "secret.txt").string() + " >" + o2 +
+                               " 2>&1")
+                                  .c_str());
+            std::ifstream f2(o2);
+            std::string b2((std::istreambuf_iterator<char>(f2)),
+                           std::istreambuf_iterator<char>());
+            fs::remove(o2);
+
+            check(!has(b2, "TOPSECRET"),
+                  "a DISCOVERED policy cannot grant a path outside its own "
+                  "directory");
+            check(has(b2, "refused"),
+                  "...and says so, rather than silently dropping the grant");
+
+            // The operator's own invocation must still work in full --
+            // otherwise this fix has broken the documented workflow
+            // (`synthesize > bastion.toml` then `run --policy bastion.toml`).
+            const std::string o3 = "/tmp/bastion-diag-explicit.txt";
+            (void)std::system(("cd " + proj.string() + " && " + BASTION_CLI +
+                               " run --no-ledger --policy bastion.toml -- cat " +
+                               (outside / "secret.txt").string() + " >" + o3 +
+                               " 2>&1")
+                                  .c_str());
+            std::ifstream f3(o3);
+            std::string b3((std::istreambuf_iterator<char>(f3)),
+                           std::istreambuf_iterator<char>());
+            fs::remove(o3);
+
+            check(has(b3, "TOPSECRET"),
+                  "--policy still carries full operator authority");
+
+            fs::remove_all(outside);
+        }
+
         fs::remove_all(proj);
     }
 

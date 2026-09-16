@@ -202,6 +202,48 @@ reported that a workload which had demonstrably read `/etc/hosts` and written
 
 ---
 
+### 4.5 A confined workload could widen its own policy
+
+**Severity: critical (full escape).** Found by dogfooding, not by review.
+
+`bastion run` auto-discovers `./bastion.toml`, the way every other tool finds
+its config. But the directory holding that file is the workspace — which the
+sandboxed workload can **write to**. So the agent writes its own policy:
+
+```sh
+# Run 1: confined to the workspace, with no access to $HOME.
+bastion run -- sh -c 'printf "[[allow]]\nop=\"fs.read\"\npath=\"/home/me\"\n" > bastion.toml'
+
+# Run 2: bastion discovers the file and obeys it.
+bastion run -- cat ~/.ssh/id_ed25519      # -> the private key
+```
+
+Two invocations, no privilege escalation, no kernel bug, complete escape — and
+it persists across reboots because the file stays on disk. The same trick with
+`tier = "t0"` disables enforcement altogether, since T0 does not confine.
+
+The flaw is not in the parser or the backend. It is that **authority was taken
+from an input inside the blast radius**. A sandbox may never widen itself on
+the say-so of the thing it is sandboxing.
+
+**Fix:** discovery is a convenience, so it carries convenience's authority. A
+*discovered* policy may only narrow what happens **in its own directory**: path
+grants outside that directory are refused and reported, egress grants are
+refused outright (the network is never local to a directory), and the tier can
+only be raised, never lowered. An explicit `--policy` is the **operator**
+speaking from outside the sandbox and is still honoured in full.
+
+Deliberately *not* fixed by checking file ownership or permissions: the agent
+runs as the same uid as the operator, so the file it writes is byte-for-byte
+indistinguishable from one the operator wrote. Only **provenance** separates
+them — and provenance is exactly what `--policy` carries and discovery does not.
+
+Both directions are asserted in `tests/diagnostics_test.cpp`: the escape fails,
+*and* `--policy` still grants in full. Reverting the guard makes the test fail,
+which is how the assertion was verified to be real.
+
+---
+
 ## 5. Known limits
 
 Each is asserted as a `LIMIT` in the test suite. If one ever tightens, the test
