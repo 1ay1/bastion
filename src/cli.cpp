@@ -70,6 +70,50 @@ const char* op_for(Right r) {
     return "unknown";
 }
 
+// Walk up from `start` looking for a project root marker.
+//
+// WHY: the default workspace is the current directory, which is correct for a
+// flat repo and wrong for every monorepo. MEASURED: an agent working in
+// packages/app could not read ../lib or ../../tsconfig.json -- both denied,
+// with nothing explaining why. That is the single most common real-world
+// layout, and the failure looks like a broken toolchain rather than a policy
+// decision.
+//
+// The markers are deliberately VCS/lockfile roots rather than "any directory
+// with a package.json": in a monorepo every package has one of those, so the
+// nearest match would be the subdirectory we are already in. A .git directory
+// or a workspace lockfile identifies the tree a developer thinks of as "the
+// project", which is the boundary they expect.
+//
+// Bounded: stops at $HOME or / so a stray .git in a parent directory cannot
+// silently widen the sandbox to the whole home directory.
+std::optional<fs::path> find_project_root(const fs::path& start) {
+    static constexpr const char* kMarkers[] = {
+        ".git", ".hg", ".svn", ".jj",
+        "go.work", "pnpm-workspace.yaml", "lerna.json", "nx.json",
+        "Cargo.toml", "go.mod",
+    };
+
+    std::error_code ec;
+    fs::path home;
+    if (const char* h = std::getenv("HOME"); h && *h == '/') home = h;
+
+    for (fs::path dir = start; !dir.empty() && dir != dir.root_path();
+         dir = dir.parent_path()) {
+        // Never treat $HOME ITSELF as the project root. Dotfile repos are
+        // common, so a .git directly in the home directory is normal -- and
+        // accepting it would silently widen the sandbox from one project to
+        // everything the user owns. Checked BEFORE the markers, so the match
+        // never happens rather than happening and being regretted.
+        if (!home.empty() && dir == home) break;
+
+        for (const char* m : kMarkers) {
+            if (fs::exists(dir / m, ec) && !ec) return dir;
+        }
+    }
+    return std::nullopt;
+}
+
 BackendCaps active_backend() {
 #if defined(__APPLE__)
     return darwin::probe();
@@ -394,11 +438,30 @@ std::optional<Sealed> build_policy(const Args& a, Broker& broker,
     if (!from_file && a.workspace.empty() && a.read.empty()) {
         // Path-set authority means the CURRENT directory just works -- there is
         // no fixed sandbox root to symlink things into (DESIGN.md §3).
+        //
+        // But "current directory" is the wrong default inside a monorepo. An
+        // agent working in packages/app needs ../lib and the root config, and
+        // got `Permission denied` on both with nothing saying why. So the
+        // default is the PROJECT ROOT when one is detectable -- the tree the
+        // developer thinks of as "the project" -- and the cwd otherwise.
+        //
+        // Reported, so the boundary is never a surprise: a grant wider than
+        // the directory you are standing in has to be visible.
         std::error_code ec;
         auto cwd = fs::current_path(ec);
         if (!ec) {
-            p = std::move(p).allow(Right::FsRead | Right::FsWrite, cwd,
-                                   "current directory (default workspace)");
+            fs::path ws = cwd;
+            const char* why = "current directory (default workspace)";
+            if (auto root = find_project_root(cwd); root && *root != cwd) {
+                ws = *root;
+                why = "project root (detected; use -w to override)";
+                if (!a.json) {
+                    std::fprintf(stderr,
+                                 "bastion: workspace = %s (project root)\n",
+                                 ws.c_str());
+                }
+            }
+            p = std::move(p).allow(Right::FsRead | Right::FsWrite, ws, why);
         }
     }
     for (const auto& w : a.workspace) {

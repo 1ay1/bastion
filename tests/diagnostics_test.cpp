@@ -424,6 +424,68 @@ int main() {
               "a missing PATH entry is not granted");
     }
 
+    std::puts("\n== 15. a monorepo subdirectory can reach its own project ==");
+    {
+        // The most common real layout, and it was broken. An agent working in
+        // packages/app got `Permission denied` on ../lib and on the root
+        // tsconfig.json, because the default workspace was the CURRENT
+        // directory. Nothing explained why, so it reads as a broken toolchain.
+        const fs::path mono = "/tmp/bastion-diag-mono";
+        fs::remove_all(mono);
+        fs::create_directories(mono / "packages/app");
+        fs::create_directories(mono / "packages/lib");
+        fs::create_directories(mono / ".git");  // the root marker
+        { std::ofstream{mono / "packages/lib/l.txt"} << "lib\n"; }
+        { std::ofstream{mono / "root.json"} << "root\n"; }
+
+        const std::string out = "/tmp/bastion-diag-mono.txt";
+        const std::string cmd =
+            "cd " + (mono / "packages/app").string() + " && " + BASTION_CLI +
+            " run --no-ledger -- sh -c 'cat ../lib/l.txt && cat ../../root.json'"
+            " >" + out + " 2>&1";
+        (void)std::system(cmd.c_str());
+
+        std::ifstream f(out);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+
+        check(has(body, "lib") && has(body, "root"),
+              "a sibling package and the repo root are both readable");
+        // The wider grant must be VISIBLE. Silently widening the boundary is
+        // how a user ends up surprised by what the sandbox allowed.
+        check(has(body, "project root"),
+              "...and the widened workspace is announced, not silent");
+    }
+
+    std::puts("\n== 16. project-root detection stops at $HOME ==");
+    {
+        // Dotfile repos are common, so a .git directly in the home directory
+        // is normal. Treating it as a project root would widen the sandbox
+        // from one project to everything the user owns -- the exact
+        // over-grant this feature must not introduce.
+        const fs::path fake_home = "/tmp/bastion-diag-home";
+        fs::remove_all(fake_home);
+        fs::create_directories(fake_home / "sub/deep");
+        fs::create_directories(fake_home / ".git");  // dotfiles repo
+
+        const std::string out = "/tmp/bastion-diag-home.txt";
+        const std::string cmd =
+            "cd " + (fake_home / "sub/deep").string() + " && HOME=" +
+            fake_home.string() + " " + BASTION_CLI +
+            " run --no-ledger -- pwd >" + out + " 2>&1";
+        (void)std::system(cmd.c_str());
+
+        std::ifstream f(out);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+        fs::remove_all(fake_home);
+
+        check(!has(body, "project root"),
+              "a .git in $HOME itself is NOT treated as a project root");
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",
