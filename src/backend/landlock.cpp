@@ -188,6 +188,13 @@ AbiInfo probe_abi() {
     return info;
 }
 
+// Defined here rather than in the header so the UAPI constants stay inside the
+// backend: kWriteRights is the SAME mask compile() grants, so a report built
+// on this cannot drift from what the kernel was told.
+bool Ruleset::PathRule::writable() const noexcept {
+    return (allowed & kWriteRights) != 0;
+}
+
 Result<Ruleset> compile(const Sealed& policy, const AbiInfo& abi,
                         std::uint16_t proxy_port) {
     Ruleset rs;
@@ -746,6 +753,10 @@ AbiInfo probe_abi() {
 }
 
 std::size_t AbiCore::ruleset_attr_size() const noexcept { return 0; }
+
+// No kernel here, so nothing is ever granted -- but the symbol must exist or
+// anything that reports a boundary fails to link on this platform.
+bool Ruleset::PathRule::writable() const noexcept { return false; }
 
 Ruleset compile(const Sealed&, const AbiInfo& abi, std::uint16_t) {
     Ruleset rs;

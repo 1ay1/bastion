@@ -480,6 +480,45 @@ int main() {
               "a missing PATH entry is not granted");
     }
 
+    std::puts("\n== 14b. explain reports the boundary it ACTUALLY enforces ==");
+    {
+        // `explain` exists to print the real enforced boundary, so
+        // UNDER-reporting is the one failure it cannot have. MEASURED: it
+        // printed "rules (1): rw <workspace>" for a sandbox that could also
+        // read /usr and /bin and write ~/.cache, because compile() adds the
+        // ergonomic floor and explain showed the PRE-floor policy. Someone
+        // checking whether a path was exposed would have consulted a list
+        // that did not mention it.
+        const std::string out = "/tmp/bastion-diag-floor.txt";
+        (void)std::system((std::string{BASTION_CLI} + " explain -w " +
+                           ws.string() + " >" + out + " 2>&1")
+                              .c_str());
+        std::ifstream f(out);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        fs::remove(out);
+
+        check(has(body, "ergonomic floor"),
+              "explain names the ergonomic floor rather than hiding it");
+        check(has(body, "/usr"),
+              "...including /usr, which the sandbox really can read");
+
+        // And the read/write labels must come from the compiled mask, not an
+        // assumption. An earlier version called the WHOLE floor "READ-ONLY"
+        // while /dev/null and the caches are writable by design -- an error
+        // in the understating direction, which is the dangerous one.
+        check(!has(body, "READ-ONLY"),
+              "explain does not claim the floor is read-only");
+        const auto devnull = body.find("/dev/null");
+        if (devnull != std::string::npos) {
+            const auto line_start = body.rfind('\n', devnull);
+            const std::string line =
+                body.substr(line_start + 1, devnull - line_start);
+            check(line.find("rw") != std::string::npos,
+                  "/dev/null is labelled writable, because it is");
+        }
+    }
+
     std::puts("\n== 15. a monorepo subdirectory can reach its own project ==");
     {
         // The most common real layout, and it was broken. An agent working in

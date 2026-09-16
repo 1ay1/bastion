@@ -98,6 +98,16 @@ struct Ruleset {
     struct PathRule {
         std::string path;
         std::uint64_t allowed = 0;
+
+        // Does this rule permit MODIFYING anything at the path?
+        //
+        // Lives here, next to the mask, because the UAPI constants are not in
+        // scope for callers outside the backend -- and because a caller that
+        // has to guess gets it wrong. MEASURED: `bastion explain` labelled the
+        // whole ergonomic floor "READ-ONLY", while /dev/null, the private temp
+        // dir and the toolchain caches are writable by design. Understating
+        // access is the one error a boundary report must not make.
+        [[nodiscard]] bool writable() const noexcept;
     };
     std::vector<PathRule> paths;
     struct PortRule {

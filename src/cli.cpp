@@ -719,6 +719,47 @@ int cmd_explain(const Args& a) {
     for (const auto& w : rs.value().warnings) {
         std::printf("\n[warning] %s\n", w.c_str());
     }
+
+    // THE FLOOR IS PART OF THE BOUNDARY, SO SAY SO.
+    //
+    // MEASURED: `explain -w /tmp/ex` reported "rules (1): rw /tmp/ex", while
+    // the sandbox it describes could read /usr, /bin, the locale data and the
+    // toolchain caches -- because compile() adds the ergonomic floor and
+    // explain printed the PRE-floor policy. For a command whose stated job is
+    // "print the REAL enforced boundary", under-reporting is the one thing it
+    // must not do: a reader checking whether a secret is exposed would have
+    // consulted a list that does not mention the paths actually granted.
+    //
+    // Printed from the COMPILED ruleset -- the same bytes handed to the
+    // kernel -- rather than re-deriving the floor here, so the two cannot
+    // disagree. Anything already shown above is skipped.
+    std::vector<std::pair<std::string, bool>> floor;  // path, writable
+    for (const auto& pr : rs.value().paths) {
+        bool explicit_grant = false;
+        for (const auto& r : policy.rules()) {
+            if (r.scope == pr.path) { explicit_grant = true; break; }
+        }
+        if (explicit_grant) continue;
+        // Label from the COMPILED access mask, never from an assumption about
+        // what a floor path "should" be. MEASURED: an earlier version of this
+        // printed every floor path as READ-ONLY, but /dev/null, the temp dir
+        // and the toolchain caches are writable by design -- so the summary
+        // was wrong in the direction that matters, understating access.
+        floor.emplace_back(pr.path, pr.writable());
+    }
+    if (!floor.empty()) {
+        std::size_t writables = 0;
+        for (const auto& f : floor) writables += f.second ? 1 : 0;
+        std::printf("\nergonomic floor (%zu), added so ordinary tools work:\n",
+                    floor.size());
+        for (const auto& [p, w] : floor) {
+            std::printf("  %-3s %s\n", w ? "rw" : "r", p.c_str());
+        }
+        std::printf("      Part of the ENFORCED boundary, not a suggestion: "
+                    "%zu readable, %zu writable.\n"
+                    "      `bastion doctor` explains why each is here.\n",
+                    floor.size() - writables, writables);
+    }
 #endif
     return 0;
 }
