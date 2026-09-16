@@ -346,6 +346,56 @@ std::vector<std::string> sanitized_env(const Sealed& policy) {
     env.emplace_back("LANG=en_US.UTF-8");
     env.emplace_back(std::string{"TERM="} + getenv_or("TERM", "dumb"));
 
+    // BUILD-RELEVANT VARIABLES, passed through when set.
+    //
+    // The sanitized environment was so minimal that toolchains changed
+    // behaviour inside the sandbox. MEASURED: CI, LC_ALL, TZ, NO_COLOR,
+    // MAKEFLAGS, RUSTFLAGS, CFLAGS, GOFLAGS, VIRTUAL_ENV and the npm/pip
+    // config variables were ALL dropped -- so `make -j8` became single
+    // threaded, a test suite that keys off CI took its interactive path, and
+    // `pip` inside an activated venv could not see the venv it was told to
+    // use. None of that looks like a sandbox; it looks like the tool is
+    // broken, which is exactly the friction that gets sandboxes switched off.
+    //
+    // These are NAMED rather than inherited wholesale. A blanket copy would
+    // bring the credential material is_dangerous_env() exists to strip; an
+    // allowlist means a new secret-bearing variable is denied by default and
+    // a new build variable is a one-line, reviewable addition.
+    //
+    // Deliberately absent: anything matching a token/key/secret shape, and
+    // *_PROXY. A proxy variable would silently redirect a workload's egress
+    // through a host the policy never authorised, which at T3 would route
+    // around the broker that is the whole point of the tier.
+    static constexpr const char* kBuildEnv[] = {
+        // Build-system behaviour
+        "CI", "MAKEFLAGS", "MAKELEVEL", "NINJA_STATUS", "JOBS",
+        // Locale and time, which affect test output and timestamps
+        "LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LANGUAGE", "TZ",
+        // Terminal presentation
+        "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "COLUMNS",
+        "LINES",
+        // Toolchain flags
+        "CFLAGS", "CXXFLAGS", "LDFLAGS", "CPPFLAGS", "RUSTFLAGS", "GOFLAGS",
+        "CC", "CXX", "AR", "RANLIB", "PKG_CONFIG_PATH",
+        // Language runtimes and their environments
+        "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH",
+        "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
+        "NODE_OPTIONS", "NODE_ENV", "npm_config_registry", "npm_config_prefix",
+        "GOPATH", "GOTOOLCHAIN", "GOPROXY", "GONOSUMDB", "GOPRIVATE",
+        "CARGO_BUILD_JOBS", "CARGO_TERM_COLOR",
+        "JAVA_HOME", "GRADLE_OPTS", "MAVEN_OPTS",
+        "RBENV_VERSION", "ASDF_DIR", "MISE_DATA_DIR",
+    };
+    for (const char* k : kBuildEnv) {
+        if (const char* v = std::getenv(k); v && *v) {
+            const std::string kv = std::string{k} + "=" + v;
+            // Still filtered: a variable on this list whose VALUE looks like
+            // credential material is dropped rather than trusted because its
+            // name was approved.
+            if (!is_dangerous_env(kv)) env.emplace_back(kv);
+        }
+    }
+
     // The ergonomic floor (DESIGN.md §4). The field report's single biggest
     // win was "the return of rw in /tmp ... LLMs will stop going around in
     // circles", so TMPDIR pointing at a writable location is asserted here

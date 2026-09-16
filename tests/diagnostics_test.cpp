@@ -486,6 +486,51 @@ int main() {
               "a .git in $HOME itself is NOT treated as a project root");
     }
 
+    std::puts("\n== 17. build vars survive; secrets do not ==");
+    {
+        // The sanitized environment was so minimal that toolchains changed
+        // behaviour inside the sandbox: `make -j8` went single-threaded,
+        // suites keying off CI took their interactive path, and pip inside an
+        // activated venv could not see VIRTUAL_ENV. None of that looks like a
+        // sandbox -- it looks like the tool is broken.
+        //
+        // Both directions matter. Passing everything through would leak the
+        // credential material the sanitizer exists to strip; passing nothing
+        // through is the friction that gets sandboxes switched off.
+        auto value_of = [&](const char* var, const char* val) {
+            const std::string out = "/tmp/bastion-diag-env.txt";
+            const std::string cmd =
+                std::string{var} + "=" + val + " " + BASTION_CLI +
+                " run --no-ledger -w " + ws.string() +
+                " -- sh -c 'printf %s \"$" + std::string{var} + "\"' >" + out +
+                " 2>/dev/null";
+            (void)std::system(cmd.c_str());
+            std::ifstream f(out);
+            std::string s((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+            fs::remove(out);
+            return s;
+        };
+
+        for (const char* v : {"CI", "MAKEFLAGS", "RUSTFLAGS", "VIRTUAL_ENV",
+                              "NO_COLOR", "TZ"}) {
+            check(value_of(v, "KEPT") == "KEPT",
+                  (std::string{v} + " reaches the workload").c_str());
+        }
+
+        for (const char* v : {"GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
+                              "OPENAI_API_KEY", "NPM_TOKEN", "LD_PRELOAD"}) {
+            check(value_of(v, "LEAKED").empty(),
+                  (std::string{v} + " is stripped").c_str());
+        }
+
+        // Proxies are deliberately absent from the allowlist: one would
+        // silently redirect egress through a host the policy never authorised,
+        // routing around the T3 broker that is the whole point of the tier.
+        check(value_of("HTTP_PROXY", "http://evil").empty(),
+              "HTTP_PROXY is stripped, so egress cannot be redirected");
+    }
+
     fs::remove_all(ws);
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "diagnostics verified" : "FAILURES",
