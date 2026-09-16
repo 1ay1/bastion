@@ -127,4 +127,18 @@ public:
     [[nodiscard]] virtual std::vector<std::string> preflight() const = 0;
 };
 
+// What this machine can actually enforce, probed at runtime.
+//
+// The FIRST question any embedder asks: bastion is linked in, but is it
+// usable HERE? A kernel too old for Landlock, a container that forbids
+// seccomp, a platform with no backend at all — each answers with a lower
+// max_tier rather than a failure at spawn time, so a host can choose a
+// different sandbox instead of discovering the gap on the first tool call.
+//
+// Lived in cli.cpp until agentty needed it. That is the tell for a missing
+// API: a host embedding bastion as a library had no way to ask this without
+// running the CLI and parsing its stdout, which is both fragile and a
+// process spawn for a question answerable in-process.
+[[nodiscard]] BackendCaps active_backend();
+
 }  // namespace bastion

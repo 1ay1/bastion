@@ -1,4 +1,10 @@
 #include "bastion/policy.hpp"
+#include "bastion/tier.hpp"
+#if defined(__APPLE__)
+#  include "bastion/backend/seatbelt.hpp"
+#elif defined(__linux__)
+#  include "bastion/backend/landlock.hpp"
+#endif
 
 #include <sstream>
 
@@ -187,6 +193,22 @@ std::string Sealed::explain() const {
         o << "  " << r.scope << "\n      (" << r.provenance << ")\n";
     }
     return o.str();
+}
+
+// See tier.hpp: the runtime capability probe, public so an embedding host can
+// ask it without spawning the CLI.
+BackendCaps active_backend() {
+#if defined(__APPLE__)
+    return darwin::probe();
+#elif defined(__linux__)
+    return linux_ll::probe();
+#else
+    BackendCaps c;
+    c.name = "none";
+    c.max_tier = Tier::Advisory;
+    c.version_note = "no kernel backend for this platform";
+    return c;
+#endif
 }
 
 }  // namespace bastion

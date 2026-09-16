@@ -115,19 +115,6 @@ std::optional<fs::path> find_project_root(const fs::path& start) {
     return std::nullopt;
 }
 
-BackendCaps active_backend() {
-#if defined(__APPLE__)
-    return darwin::probe();
-#elif defined(__linux__)
-    return linux_ll::probe();
-#else
-    BackendCaps c;
-    c.name = "none";
-    c.max_tier = Tier::Advisory;
-    c.version_note = "no kernel backend for this platform";
-    return c;
-#endif
-}
 
 std::string default_ledger_path() {
     if (const char* e = std::getenv("BASTION_LEDGER"); e && *e) return e;
