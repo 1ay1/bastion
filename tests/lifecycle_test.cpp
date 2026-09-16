@@ -58,32 +58,20 @@ static int count_matching(const char* needle) {
     return n;
 }
 
-int main() {
-    // A marker unique to this run, so a stale process from an earlier test
-    // cannot make a broken build look healthy.
-    //
-    // It must appear in EACH child's own argv, not just in the `sh -c` string.
-    // A trailing `# marker` comment lives only in the shell's command line, so
-    // the grandchildren would be invisible and the test would count one
-    // process where it should count four -- which is exactly the failure this
-    // test exists to catch, so getting it wrong would be self-defeating.
-    const std::string marker =
-        "bastion-lifecycle-" + std::to_string(::getpid());
-
+// Runs `bastion <subcommand>` on a workload that backgrounds three sleeps,
+// kills bastion, and reports how many survive. Returns the survivor count.
+static int orphans_after_kill(const char* subcommand, const std::string& marker) {
     // `exec -a NAME` sets argv[0], so each grandchild carries the marker in
-    // its own /proc/PID/cmdline.
-    const std::string sleeper =
-        "sh -c 'exec -a " + marker + " sleep 45'";
+    // its own /proc/PID/cmdline. It must appear in EACH child's argv, not just
+    // the `sh -c` string: a trailing `# marker` comment lives only in the
+    // shell's command line, so the grandchildren would be invisible and this
+    // would count one process where it should count four -- which is exactly
+    // the failure being tested, so getting it wrong would be self-defeating.
+    const std::string sleeper = "sh -c 'exec -a " + marker + " sleep 45'";
+    const std::string script = sleeper + " & " + sleeper + " & " + sleeper;
 
-    std::puts("== killing bastion kills the whole subtree ==");
-
-    // Spawn bastion running THREE background sleeps: the workload plus
-    // grandchildren, which is the case that actually leaks.
     const pid_t bp = ::fork();
-    if (bp < 0) {
-        std::puts("  [FAIL] fork");
-        return 1;
-    }
+    if (bp < 0) return -1;
     if (bp == 0) {
         ::setsid();  // detach from the test's terminal/job control
         const int devnull = ::open("/dev/null", O_WRONLY);
@@ -91,34 +79,57 @@ int main() {
             ::dup2(devnull, STDOUT_FILENO);
             ::dup2(devnull, STDERR_FILENO);
         }
-        const std::string script =
-            sleeper + " & " + sleeper + " & " + sleeper;
-        ::execl(BASTION_CLI, "bastion", "run", "--no-ledger", "-w", "/tmp",
-                "--", "sh", "-c", script.c_str(), (char*)nullptr);
+        ::execl(BASTION_CLI, "bastion", subcommand, "--no-ledger", "--",
+                "sh", "-c", script.c_str(), (char*)nullptr);
         _exit(127);
     }
 
-    // Let the workload get going.
-    ::usleep(1500 * 1000);
+    ::usleep(1500 * 1000);  // let the workload get going
     const int before = count_matching(marker.c_str());
-    std::printf("      running before kill: %d\n", before);
-    check(before >= 3, "the workload and its children are running");
+    std::printf("      %-8s running before kill: %d\n", subcommand, before);
 
-    // The thing an agent harness does on timeout.
-    ::kill(bp, SIGTERM);
-
+    ::kill(bp, SIGTERM);  // what an agent harness does on timeout
     int st = 0;
     ::waitpid(bp, &st, 0);
     ::usleep(1500 * 1000);  // give the subtree a moment to die
 
     const int after = count_matching(marker.c_str());
-    std::printf("      surviving after kill: %d\n", after);
-    check(after == 0, "SIGTERM on bastion leaves NO orphaned processes");
+    std::printf("      %-8s surviving after kill: %d\n", subcommand, after);
 
     if (after != 0) {
         // Do not leave the machine dirtier than we found it.
-        const std::string cleanup = "pkill -9 -f '" + marker + "' 2>/dev/null";
+        const std::string cleanup =
+            "pkill -9 -f '" + marker + "' 2>/dev/null";
         (void)std::system(cleanup.c_str());
+    }
+    return after;
+}
+
+int main() {
+    std::puts("== killing bastion kills the whole subtree ==");
+
+    // BOTH supervisors. `run` waits in spawn(); `observe` has its own wait
+    // loop in the seccomp backend and did NOT inherit the fix -- it leaked
+    // four processes after `run` was already correct. They share one
+    // implementation now, and this asserts they stay that way.
+    //
+    // `observe` is the more serious of the two: an observed workload runs
+    // UNCONFINED, so an orphan from it holds the user's full authority rather
+    // than a policy's.
+    for (const char* sub : {"run", "observe"}) {
+        // Marker unique per run AND per subcommand, so a stale process from an
+        // earlier phase cannot make a broken build look healthy.
+        const std::string marker = std::string{"bastion-lifecycle-"} + sub +
+                                   "-" + std::to_string(::getpid());
+        const int orphaned = orphans_after_kill(sub, marker);
+        if (orphaned < 0) {
+            std::printf("  [FAIL] could not spawn `bastion %s`\n", sub);
+            ++failures;
+            continue;
+        }
+        check(orphaned == 0,
+              (std::string{"SIGTERM on `bastion "} + sub +
+               "` leaves NO orphaned processes").c_str());
     }
 
     std::printf("\n%s (%d failure%s)\n",

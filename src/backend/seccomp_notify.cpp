@@ -1,5 +1,7 @@
 #include "bastion/backend/seccomp_notify.hpp"
 
+#include "bastion/signal_forward.hpp"
+
 #if defined(__linux__)
 
 #  include <arpa/inet.h>
@@ -339,6 +341,15 @@ ObserveResult observe(const SpawnRequest& req) {
 
     bool child_done = false;
     int status = 0;
+
+    // Kill the SUBTREE if bastion is killed. `observe` has its own supervisor
+    // loop, so it did not inherit the fix made for `run` -- MEASURED
+    // separately, it leaked four processes with the identical bug. Shared
+    // implementation (signal_forward.hpp) so the two cannot drift again.
+    //
+    // Especially important here: an observed workload runs UNCONFINED, so an
+    // orphan from `observe` has the user's full authority, not a policy's.
+    const SignalForwarder forwarder{pid};
 
     for (;;) {
         // Poll so we can notice the workload exiting even when it is quiet.

@@ -1,5 +1,6 @@
 #include "bastion/spawn.hpp"
 
+#include "bastion/signal_forward.hpp"
 #include "bastion/unique_fd.hpp"
 
 #include <spawn.h>
@@ -243,74 +244,6 @@ std::string resolve_argv0(const std::string& cmd) {
     // rather than some half-built path.
     return cmd;
 }
-
-// ---------------------------------------------------------------------------
-// Signal forwarding: kill the SUBTREE, not just bastion.
-// ---------------------------------------------------------------------------
-//
-// MEASURED: `kill -TERM` on bastion left SIX orphaned processes running. The
-// workload and everything it spawned survived, still holding the workspace and
-// whatever else the policy granted.
-//
-// This matters specifically for agents. Harnesses run commands with a timeout
-// and kill them when it expires; an agent that runs a dev server, a watcher, or
-// a hung test then leaks a process per attempt until the machine is full. The
-// sandbox outliving the supervisor is also a confinement question: nothing is
-// left to observe or account for those processes.
-//
-// The child already has its own process group (setpgid in the child, mirrored
-// in the parent), so the whole subtree -- grandchildren included -- can be
-// signalled as one unit. That group is the reason this is a few lines rather
-// than a process-tree walk that races against fork().
-volatile std::sig_atomic_t g_child_pgid = 0;
-volatile std::sig_atomic_t g_forwarded_signal = 0;
-
-extern "C" void forward_to_child(int sig) {
-    // Async-signal-safe: only kill(2) and assignment to sig_atomic_t.
-    const pid_t pgid = static_cast<pid_t>(g_child_pgid);
-    if (pgid > 0) {
-        ::kill(-pgid, sig);  // negative pid => the entire process group
-    }
-    g_forwarded_signal = sig;
-}
-
-// Installs handlers for the duration of a run and restores them after, so a
-// library embedding bastion does not inherit our disposition.
-class SignalForwarder {
-public:
-    explicit SignalForwarder(pid_t pgid) {
-        g_child_pgid = static_cast<std::sig_atomic_t>(pgid);
-        g_forwarded_signal = 0;
-        for (std::size_t i = 0; i < kCount; ++i) {
-            struct sigaction sa {};
-            sa.sa_handler = forward_to_child;
-            ::sigemptyset(&sa.sa_mask);
-            // Deliberately NOT SA_RESTART: waitpid() should return EINTR so the
-            // parent notices promptly rather than blocking until the workload
-            // happens to exit on its own.
-            sa.sa_flags = 0;
-            ::sigaction(kSignals[i], &sa, &saved_[i]);
-        }
-    }
-
-    ~SignalForwarder() {
-        for (std::size_t i = 0; i < kCount; ++i) {
-            ::sigaction(kSignals[i], &saved_[i], nullptr);
-        }
-        g_child_pgid = 0;
-    }
-
-    SignalForwarder(const SignalForwarder&) = delete;
-    SignalForwarder& operator=(const SignalForwarder&) = delete;
-
-    // SIGHUP too: an agent harness closing its pty must not leave the subtree
-    // running detached.
-    static constexpr int kSignals[] = {SIGTERM, SIGINT, SIGHUP, SIGQUIT};
-    static constexpr std::size_t kCount = std::size(kSignals);
-
-private:
-    struct sigaction saved_[kCount] {};
-};
 
 }  // namespace
 

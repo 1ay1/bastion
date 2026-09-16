@@ -32,7 +32,7 @@ else()
 endif()
 message(STATUS "bastion: platform backend = ${BASTION_PLATFORM}")
 
-set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp src/observe.cpp src/proxy.cpp src/policy_file.cpp)
+set(BASTION_SOURCES src/policy.cpp src/spawn.cpp src/ledger.cpp src/observe.cpp src/proxy.cpp src/policy_file.cpp src/signal_forward.cpp)
 if(APPLE)
     list(APPEND BASTION_SOURCES src/backend/seatbelt.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
