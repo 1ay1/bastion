@@ -125,6 +125,50 @@ int main() {
     auto e2 = spawn(sealed, esc2);
     check(e2.launched() && e2.exit_code != 0, "SSH keys still DENIED");
 
+    // ---- 5. the SAME closed loop, for egress -----------------------------
+    //
+    // Filesystem access was recorded and network access was not, so a T3
+    // run produced a ledger holding one proc.spawn and nothing else. That
+    // is the identical failure this file was written for — `synthesize`
+    // confidently printing a policy that omits what the workload actually
+    // needed — just one op later. An egress decision that only reaches
+    // stderr cannot be synthesized from, and cannot be read by a host that
+    // wants to tell a model WHY its tool failed.
+    std::puts("\n== 5. egress decisions are RECORDED, not just printed ==");
+    {
+        AuditRecord allowed;
+        allowed.verdict = Verdict::Allow;
+        allowed.op      = "net.egress";
+        allowed.target  = "example.com:443";
+        allowed.tier    = Tier::Isolate;
+        allowed.rule    = "allowlist";
+
+        AuditRecord denied;
+        denied.verdict = Verdict::Deny;
+        denied.op      = "net.egress";
+        denied.target  = "api.github.com:443";
+        denied.tier    = Tier::Isolate;
+        denied.rule    = "allowlist-miss";
+        Remedy r;
+        r.grant = "NetEgress(api.github.com:443)";
+        r.cmd   = "bastion run -t t3 --net api.github.com:443 -- <cmd>";
+        denied.remedy = r;
+
+        // Both verdicts round-trip through the JSON the ledger stores.
+        const auto aj = allowed.to_json();
+        const auto dj = denied.to_json();
+        check(aj.find("\"op\":\"net.egress\"") != std::string::npos,
+              "an ALLOWED host is recorded (synthesize needs the positives)");
+        check(aj.find("\"verdict\":\"allow\"") != std::string::npos,
+              "...with an allow verdict");
+        check(dj.find("\"verdict\":\"deny\"") != std::string::npos,
+              "a REFUSED host is recorded");
+        check(dj.find("\"remedy\"") != std::string::npos,
+              "...carrying a remedy a model can act on");
+        check(dj.find("--net api.github.com:443") != std::string::npos,
+              "...that names the exact grant to add");
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "closed loop verified" : "FAILURES",
                 failures, failures == 1 ? "" : "s");

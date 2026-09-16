@@ -875,6 +875,46 @@ int cmd_run(const Args& a) {
             if (r.right == Right::Unconfined) rec.provenance = r.provenance;
         }
         led.record(rec);
+
+        // Egress decisions belong in the ledger too, not only on stderr.
+        //
+        // The broker knows every host the workload reached for and whether
+        // the allowlist permitted it — that is exactly the evidence
+        // `synthesize` needs to turn a watched run into a least-privilege
+        // policy. Printing it and dropping it meant a T3 session recorded
+        // only that a process was spawned, so synthesize could never widen
+        // a net grant from observation the way it widens a path grant, and
+        // a caller reading the ledger programmatically (an agent host
+        // surfacing WHY a tool failed) saw nothing at all.
+        //
+        // Both verdicts are recorded, not just denials: an allowlist that
+        // only logs what it refused cannot tell you what it permitted, and
+        // "which hosts did this build actually use" is the question a
+        // synthesized policy answers.
+        for (const auto& [hostport, allowed] : result.egress_attempts) {
+            AuditRecord e;
+            e.verdict = allowed ? Verdict::Allow : Verdict::Deny;
+            e.op      = "net.egress";
+            e.target  = hostport;
+            e.tier    = policy.tier();
+            e.rule    = allowed ? "allowlist" : "allowlist-miss";
+            if (!allowed) {
+                // Same remedy the stderr line prints, so the two channels
+                // cannot drift into telling a user and a program different
+                // things about the same refusal. (policy.cpp's remedy_for()
+                // is file-local; this is the one op it does not already
+                // cover from evaluate(), because a broker refusal happens
+                // in the proxy rather than in a policy evaluation.)
+                Remedy r;
+                r.grant = "NetEgress(" + hostport + ")";
+                r.cmd   = "bastion run -t t3 --net " + hostport + " -- <cmd>";
+                r.sanctioned_alternative =
+                    "add the host to the allowlist, or use a vendored copy";
+                e.remedy = std::move(r);
+            }
+            led.record(e);
+        }
+
         if (auto err = led.flush(); !err.empty()) {
             std::fprintf(stderr, "bastion: [warning] ledger: %s\n", err.c_str());
         } else if (led.rotated()) {
